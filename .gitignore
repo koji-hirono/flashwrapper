@@ -1,0 +1,7 @@
+[glob]
+*.o
+*.a
+*.so
+*~
+np_engine
+
