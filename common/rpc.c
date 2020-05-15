@@ -10,6 +10,49 @@
 #include "rpc.h"
 
 
+static int
+rpc_send(RPCSess *sess, const void *data, size_t size)
+{
+	const char *p = data;
+	int r;
+
+	do {
+		r = write(sess->fd, p, size);
+		if (r == -1) {
+			logger_debug("write failed. %s", strerror(errno));
+			return -1;
+		}
+		size -= r;
+		p += r;
+	} while (size > 0);
+
+	return 0;
+}
+
+static int
+rpc_recv(RPCSess *sess, void *data, size_t size)
+{
+	char *p = data;
+	int r;
+
+	do {
+		r = read(sess->fd, p, size);
+		if (r == -1) {
+			logger_debug("read failed. %s", strerror(errno));
+			return -1;
+		}
+		if (r == 0) {
+			logger_debug("read EOF");
+			return -1;
+		}
+		size -= r;
+		p += r;
+	} while (size > 0);
+
+	return 0;
+}
+
+
 int
 rpcmsghdr_encode(RPCMsgHdr *hdr, void *buf, size_t size)
 {
@@ -82,7 +125,6 @@ rpc_invoke(RPCSess *sess, RPCMsg *msg)
 	RPCMsgHdr hdr;
 	RPCMsg req;
 	void *data;
-	int r;
 
 	hdr.type = RPCTypeRequest;
 	hdr.method = msg->method;
@@ -90,27 +132,20 @@ rpc_invoke(RPCSess *sess, RPCMsg *msg)
 
 	rpcmsghdr_encode(&hdr, buf, sizeof(buf));
 
-	r = write(sess->fd, buf, sizeof(buf));
-	if (r == -1) {
-		logger_debug("write(header) failed. %s", strerror(errno));
+	if (rpc_send(sess, buf, sizeof(buf)) != 0) {
+		logger_debug("rpc_send header failed.");
 		return -1;
 	}
 	if (msg->param_size) {
-		r = write(sess->fd, msg->param, msg->param_size);
-		if (r == -1) {
-			logger_debug("write(param) failed. %s", strerror(errno));
+		if (rpc_send(sess, msg->param, msg->param_size) != 0) {
+			logger_debug("rpc_send param failed.");
 			return -1;
 		}
 	}
 
 	for (;;) {
-		r = read(sess->fd, buf, sizeof(buf));
-		if (r == -1) {
-			logger_debug("read(header) failed. %s", strerror(errno));
-			return -1;
-		}
-		if (r == 0) {
-			logger_debug("read(header) EOF");
+		if (rpc_recv(sess, buf, sizeof(buf)) != 0) {
+			logger_debug("rpc_recv header failed.");
 			return -1;
 		}
 
@@ -120,14 +155,8 @@ rpc_invoke(RPCSess *sess, RPCMsg *msg)
 			data = malloc(hdr.size);
 			if (data == NULL)
 				return -1;
-			r = read(sess->fd, data, hdr.size);
-			if (r == -1) {
-				logger_debug("read failed. %s", strerror(errno));
-				free(data);
-				return -1;
-			}
-			if (r == 0) {
-				logger_debug("read FIN");
+			if (rpc_recv(sess, data, hdr.size) != 0) {
+				logger_debug("rpc_recv failed.");
 				free(data);
 				return -1;
 			}
@@ -162,15 +191,9 @@ rpc_handle(RPCSess *sess)
 	RPCMsgHdr hdr;
 	RPCMsg req;
 	void *data;
-	int r;
 
-	r = read(sess->fd, buf, sizeof(buf));
-	if (r == -1) {
-		logger_debug("read(header) failed. %s", strerror(errno));
-		return -1;
-	}
-	if (r == 0) {
-		logger_debug("read(header) EOF");
+	if (rpc_recv(sess, buf, sizeof(buf)) != 0) {
+		logger_debug("rpc_recv header failed.");
 		return -1;
 	}
 
@@ -180,14 +203,8 @@ rpc_handle(RPCSess *sess)
 		data = malloc(hdr.size);
 		if (data == NULL)
 			return -1;
-		r = read(sess->fd, data, hdr.size);
-		if (r == -1) {
-			logger_debug("read failed. %s", strerror(errno));
-			free(data);
-			return -1;
-		}
-		if (r == 0) {
-			logger_debug("read FIN");
+		if (rpc_recv(sess, data, hdr.size) != 0) {
+			logger_debug("rpc_recv failed.");
 			free(data);
 			return -1;
 		}
@@ -219,7 +236,6 @@ rpc_return(RPCSess *sess, RPCMsg *msg)
 {
 	char buf[RPCMsgHdrSize];
 	RPCMsgHdr hdr;
-	int r;
 	
 	hdr.type = RPCTypeResponse;
 	hdr.method = msg->method;
@@ -227,15 +243,13 @@ rpc_return(RPCSess *sess, RPCMsg *msg)
 
 	rpcmsghdr_encode(&hdr, buf, sizeof(buf));
 
-	r = write(sess->fd, buf, sizeof(buf));
-	if (r == -1) {
-		logger_debug("write(header) failed. %s", strerror(errno));
+	if (rpc_send(sess, buf, sizeof(buf)) != 0) {
+		logger_debug("rpc_send header failed.");
 		return -1;
 	}
 	if (msg->ret_size) {
-		r = write(sess->fd, msg->ret, msg->ret_size);
-		if (r == -1) {
-			logger_debug("write(ret) failed. %s", strerror(errno));
+		if (rpc_send(sess, msg->ret, msg->ret_size) != 0) {
+			logger_debug(" rpc_send ret failed.");
 			return -1;
 		}
 	}
