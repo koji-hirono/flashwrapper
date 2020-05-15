@@ -148,6 +148,8 @@ rpc_invoke(RPCSess *sess, RPCMsg *msg)
 		req.ret_size = 0;
 
 		sess->dispatch(sess, &req, sess->ctxt);
+
+		free(data);
 	}
 
 	return 0;
