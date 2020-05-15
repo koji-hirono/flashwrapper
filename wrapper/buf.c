@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "logger.h"
 #include "buf.h"
 
 
@@ -161,7 +162,7 @@ buf_uint64_decode(BufReader *r, uint64_t *x)
 	const char *p;
 	size_t i;
 
-	if (r->pos >= r->len)
+	if (r->pos + sizeof(*x) > r->len)
 		return NULL;
 
 	p = (const char *)r->data + r->pos;
@@ -183,7 +184,7 @@ buf_uint32_decode(BufReader *r, uint32_t *x)
 	const char *p;
 	size_t i;
 
-	if (r->pos >= r->len)
+	if (r->pos + sizeof(*x) > r->len)
 		return NULL;
 
 	p = (const char *)r->data + r->pos;
@@ -205,7 +206,7 @@ buf_uint16_decode(BufReader *r, uint16_t *x)
 	const char *p;
 	size_t i;
 
-	if (r->pos >= r->len)
+	if (r->pos + sizeof(*x) > r->len)
 		return NULL;
 
 	p = (const char *)r->data + r->pos;
@@ -226,7 +227,7 @@ buf_uint8_decode(BufReader *r, uint8_t *x)
 {
 	const char *p;
 
-	if (r->pos >= r->len)
+	if (r->pos + 1 > r->len)
 		return NULL;
 
 	p = (const char *)r->data + r->pos;
@@ -249,7 +250,7 @@ buf_bytes_decode(BufReader *r, size_t len)
 {
 	const char *p;
 
-	if (r->pos >= r->len)
+	if (r->pos + len > r->len)
 		return NULL;
 
 	p = (const char *)r->data + r->pos;
