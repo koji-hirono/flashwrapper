@@ -1,9 +1,12 @@
 PROG:=np_engine
-SRCS:=engine_main.c
+SRCS:=main.c
 SRCS+=plugin.c
 SRCS+=browser.c
-SRCS+=util.c
-SRCS+=logger.c
+SRCS+=npp.c
+SRCS+=../common/rpc.c
+SRCS+=../common/buf.c
+SRCS+=../common/util.c
+SRCS+=../common/logger.c
 OBJS:=$(SRCS:.c=.o)
 
 LDADD:=$(shell pkg-config --libs gtk+-2.0)
@@ -13,7 +16,11 @@ LDADD+=-ldl
 CC:=cc
 CPPFLAGS:=-Wall
 CPPFLAGS+=-W
+CPPFLAGS+=-Wno-unused-function
+CPPFLAGS+=-Wno-unused-parameter
+CPPFLAGS+=-Wno-pointer-sign
 CPPFLAGS+=-I../include
+CPPFLAGS+=-I../common
 CPPFLAGS+=-DXP_UNIX=1
 CPPFLAGS+=-DMOZ_X11=1
 CPPFLAGS+=$(shell pkg-config --cflags gtk+-2.0)

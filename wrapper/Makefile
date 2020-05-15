@@ -1,10 +1,10 @@
 LIB:=libwrapper.so
 SRCS:=wrapper.c
 SRCS+=engine.c
-SRCS+=rpc.c
-SRCS+=buf.c
-SRCS+=util.c
-SRCS+=logger.c
+SRCS+=../common/rpc.c
+SRCS+=../common/buf.c
+SRCS+=../common/util.c
+SRCS+=../common/logger.c
 OBJS:=$(SRCS:.c=.o)
 
 CC:=cc
@@ -13,6 +13,7 @@ CPPFLAGS+=-W
 CPPFLAGS+=-Wno-unused-parameter
 CPPFLAGS+=-Wno-pointer-sign
 CPPFLAGS+=-I../include
+CPPFLAGS+=-I../common
 CPPFLAGS+=-DXP_UNIX=1
 CPPFLAGS+=-fPIC
 CPPFLAGS+=-pipe

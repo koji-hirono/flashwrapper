@@ -14,6 +14,7 @@
 
 #include "logger.h"
 #include "util.h"
+#include "npp.h"
 #include "rpc.h"
 #include "buf.h"
 #include "plugin.h"
@@ -288,10 +289,8 @@ NPP_New_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 	BufReader r;
 	BufWriter w;
 	char *pluginType;
-	NPP_t np = {
-		.pdata = NULL,
-		.ndata = NULL
-	};
+	uintptr_t ident;
+	NPP npp;
 	uint16_t mode;
 	uint16_t argc;
 	NPSavedData *saved;
@@ -303,6 +302,7 @@ NPP_New_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 	logger_debug("start");
 
 	buf_reader_init(&r, msg->param, msg->param_size);
+
 	buf_uint32_decode(&r, &len);
 	if (len) {
 		pluginType = buf_bytes_decode(&r, len);
@@ -310,8 +310,19 @@ NPP_New_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 		pluginType = NULL;
 	}
 	logger_debug("pluginType: %s", pluginType);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_create(ident);
+	if (npp == NULL) {
+		logger_debug("npp_create failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
 	buf_uint16_decode(&r, &mode);
 	logger_debug("mode: %u", mode);
+
 	buf_uint16_decode(&r, &argc);
 	logger_debug("argc: %u", argc);
 
@@ -347,12 +358,59 @@ NPP_New_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 		logger_dump("saved", saved->buf, saved->len);
 	}
 
-	error = p->funcs.newp(pluginType, &np, mode, argc, argn, argv, saved);
+	error = p->funcs.newp(pluginType, npp, mode, argc, argn, argv, saved);
 
 	logger_debug("error: %s(%d)", np_errorstr(error), error);
 
 	buf_writer_open(&w, 0);
 	buf_uint16_encode(&w, error);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPP_Destroy_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	BufWriter w;
+	uintptr_t ident;
+	NPP npp;
+	NPSavedData *saved;
+	NPError error;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	saved = NULL;
+	error = p->funcs.destroy(npp, &saved);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	buf_writer_open(&w, 0);
+	buf_uint16_encode(&w, error);
+	if (saved) {
+		buf_uint32_encode(&w, saved->len);
+		buf_bytes_encode(&w, saved->buf, saved->len);
+	} else {
+		buf_uint32_encode(&w, 0);
+	}
 
 	msg->ret = w.data;
 	msg->ret_size = w.len;
@@ -389,6 +447,9 @@ np_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
 		break;
 	case RPC_NPP_New:
 		NPP_New_handle(p, b, sess, msg);
+		break;
+	case RPC_NPP_Destroy:
+		NPP_Destroy_handle(p, b, sess, msg);
 		break;
 	default:
 		break;

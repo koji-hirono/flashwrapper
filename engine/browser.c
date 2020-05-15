@@ -12,6 +12,7 @@
 
 #include "logger.h"
 #include "util.h"
+#include "npp.h"
 #include "buf.h"
 #include "rpc.h"
 #include "browser.h"
@@ -20,10 +21,6 @@
 static Browser *g_browser = NULL;
 static NPClass npobj_class = {};
 
-static NPObject npobj_window = {
-	._class = &npobj_class,
-	.referenceCount = 1
-};
 
 static NPError
 b_geturl(NPP npp, const char *relativeURL, const char *target)
@@ -78,34 +75,40 @@ b_status(NPP npp, const char *message)
 static const char *
 b_uagent(NPP npp)
 {
-	Browser *b;
+	Browser *b = g_browser;
 	RPCMsg msg = {
 		.method = RPC_NPN_UserAgent,
 	};
+	BufWriter w;
 	BufReader r;
 	uint32_t len;
 	static char *s = NULL;
 
 	logger_debug("start");
+	logger_debug("npp: %p", npp);
 
 	if (s)
 		return s;
 
-	if (npp == NULL)
-		b = g_browser;
-	else
-		b = npp->ndata;
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+
+	msg.param = w.data;
+	msg.param_size = w.len;
 
 	rpc_invoke(b->sess, &msg);
+
+	buf_writer_close(&w);
 
 	buf_reader_init(&r, msg.ret, msg.ret_size);
 	buf_uint32_decode(&r, &len);
 	if (len) {
-		s = buf_bytes_decode(&r, len);
-		s = strdup(s);
+		s = strdup(buf_bytes_decode(&r, len));
 	} else {
 		s = NULL;
 	}
+
+	free(msg.ret);
 
 	return s;
 }
@@ -170,9 +173,40 @@ b_posturlnotify(NPP npp, const char *relativeURL, const char *target,
 static NPError
 b_getvalue(NPP npp, NPNVariable variable, void *result)
 {
-	Browser *b = npp->ndata;
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_GetValue,
+	};
+	BufWriter w;
+	BufReader r;
+	NPError error;
+	uint32_t len;
+	const char *s;
 
-	logger_debug("start([%d]%s)", variable, npn_varstr(variable));
+	logger_debug("start");
+	logger_debug("npp: %p", npp);
+	logger_debug("variable: %s(%d)", npn_varstr(variable), variable);
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+	buf_uint32_encode(&w, variable);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(b->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint16_decode(&r, &error);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	if (error != NPERR_NO_ERROR) {
+		free(msg.ret);
+		return error;
+	}
 
 	switch (variable) {
 	case NPNVxDisplay:
@@ -186,35 +220,49 @@ b_getvalue(NPP npp, NPNVariable variable, void *result)
 	case NPNVDOMWindow:
 		break;
 	case NPNVToolkit:
-		*((NPNToolkitType *)result) = NPNVGtk2;
+		//*((NPNToolkitType *)result) = NPNVGtk2;
+		buf_uint32_decode(&r, result);
+		logger_debug("result: %u", *(NPNToolkitType *)result);
 		break;
 	case NPNVSupportsXEmbedBool:
 		/* falseだと失敗する */
-		*(NPBool *)result = true;
+		//*(NPBool *)result = true;
+		buf_uint8_decode(&r, result);
 		logger_debug("result: %u", *(NPBool *)result);
 		break;
 	case NPNVWindowNPObject:
 		/* Get the NPObject wrapper for the browser window. */
 		/* TODO */
-		*(NPObject **)result = &npobj_window;
+		//*(NPObject **)result = &npobj_window;
+		buf_uint64_decode(&r, result);
 		logger_debug("result: %p", *(NPObject **)result);
 		break;
-		//return NPERR_GENERIC_ERROR;
 	case NPNVPluginElementNPObject:
 		/* Get the NPObject wrapper for the plugins DOM element. */
+		buf_uint64_decode(&r, result);
+		logger_debug("result: %p", *(NPObject **)result);
 		break;
 	case NPNVSupportsWindowless:
-		*(NPBool *)result = true;
+		//*(NPBool *)result = true;
+		buf_uint8_decode(&r, result);
 		logger_debug("result: %u", *(NPBool *)result);
 		break;
 	case NPNVprivateModeBool:
-		*(NPBool *)result = false;
+		//*(NPBool *)result = false;
+		buf_uint8_decode(&r, result);
 		logger_debug("result: %u", *(NPBool *)result);
 		break;
         case NPNVsupportsAdvancedKeyHandling:
 		break;
         case NPNVdocumentOrigin:
-		*(char **)result = strdup("http://yahoo-mbga.jp");
+		//*(char **)result = strdup("http://yahoo-mbga.jp");
+		buf_uint32_decode(&r, &len);
+		if (len) {
+			s = buf_bytes_decode(&r, len);
+			*(char **)result = strdup(s);
+		} else {
+			*(char **)result = NULL;
+		}
 		logger_debug("result: %p'%s'", *(char **)result, *(char **)result);
 		break;
         case NPNVCSSZoomFactor:
@@ -222,12 +270,19 @@ b_getvalue(NPP npp, NPNVariable variable, void *result)
         case NPNVsupportsAsyncBitmapSurfaceBool:
                 break;
         case NPNVmuteAudioBool:
-                *(NPBool *)result = false;
+                //*(NPBool *)result = false;
+		buf_uint8_decode(&r, result);
 		logger_debug("result: %u", *(NPBool *)result);
                 break;
         default:
-                return NPERR_GENERIC_ERROR;
+		logger_debug("unknown variable %u", variable);
+		free(msg.ret);
+		return NPERR_GENERIC_ERROR;
 	}
+
+	free(msg.ret);
+
+	logger_debug("end");
 
 	return NPERR_NO_ERROR;
 }
@@ -235,8 +290,47 @@ b_getvalue(NPP npp, NPNVariable variable, void *result)
 static NPError
 b_setvalue(NPP npp, NPPVariable variable, void *result)
 {
-	logger_debug("start([%d]%s)", variable, npp_varstr(variable));
-	return NPERR_NO_ERROR;
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_SetValue,
+	};
+	BufWriter w;
+	BufReader r;
+	NPError error;
+
+	logger_debug("start");
+	logger_debug("npp: %p", npp);
+	logger_debug("variable: %s(%d)", npp_varstr(variable), variable);
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+	buf_uint32_encode(&w, variable);
+
+	switch (variable) {
+	case NPPVpluginWindowBool:
+	case NPPVpluginTransparentBool:
+		logger_debug("result: %u", result ? 1 : 0);
+		buf_uint8_encode(&w, result ? 1 : 0);
+		break;
+	default:
+		logger_debug("unknown variable: %d", variable);
+		buf_writer_close(&w);
+		return NPERR_GENERIC_ERROR;
+	}
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(b->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint16_decode(&r, &error);
+
+	logger_debug("end(%s(%d))", np_errorstr(error), error);
+
+	return error;
 }
 
 static void
@@ -319,6 +413,8 @@ b_createobject(NPP npp, NPClass *aClass)
 	NPObject *npobj;
 
 	logger_debug("start");
+	logger_debug("npp: %p", npp);
+	logger_debug("aClass: %p", aClass);
 
 	if (aClass->allocate) {
 		npobj = aClass->allocate(npp, aClass);
@@ -358,6 +454,25 @@ b_releaseobject(NPObject *npobj)
 
 	if (npobj)
 		return;
+
+	{
+		Browser *b = g_browser;
+		RPCMsg msg = {
+			.method = RPC_NPN_ReleaseObject,
+		};
+		BufWriter w;
+
+		buf_writer_open(&w, 0);
+		buf_uint64_encode(&w, (uintptr_t)npobj);
+
+		msg.param = w.data;
+		msg.param_size = w.len;
+
+		rpc_invoke(b->sess, &msg);
+
+		buf_writer_close(&w);
+		return;
+	}
 
 	npobj->referenceCount--;
 	if (npobj->referenceCount > 0)
@@ -413,6 +528,7 @@ b_getproperty(NPP npp, NPObject *npobj, NPIdentifier property,
 		NPVariant *result)
 {
 	logger_debug("start");
+	logger_debug("npp: :%p", npp);
 	logger_debug("npobj: :%p", npobj);
 	logger_debug("property: :%p", property);
 
@@ -634,6 +750,7 @@ browser_init(Browser *b, RPCSess *sess)
 	//gtk_widget_show(b->window);
 #endif
 	g_browser = b;
+	logger_debug("browser: %p", b);
 
 	b->sess = sess;
 
