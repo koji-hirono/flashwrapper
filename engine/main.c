@@ -8,89 +8,21 @@
 #include <fcntl.h>
 
 #include <gtk/gtk.h>
+#include <gdk/gdk.h>
+#include <gdk/gdkx.h>
 
 #include "npapi.h"
 #include "npfunctions.h"
 
 #include "logger.h"
 #include "util.h"
-#include "npp.h"
 #include "rpc.h"
 #include "buf.h"
+#include "npp.h"
+#include "npstream.h"
 #include "plugin.h"
 #include "browser.h"
 
-
-static void
-test_create(Plugin *p, Browser *b)
-{
-	NPError error;
-	NPMIMEType pluginType = "application/x-shockwave-flash";
-	NPP_t np;
-	uint16_t mode = 1;
-	uint16_t argc = 19;
-	char *argn[] = {
-		"type",
-		"id",
-		"data",
-		"class",
-		"width",
-		"height",
-		"SRC",
-		"PARAM",
-		"menu",
-		"scale",
-		"allowFullscreen",
-		"allowScriptAccess",
-		"bgcolor",
-		"base",
-		"flashvars",
-		"allowscriptaccess",
-		"allowfullscreen",
-		"allownetworking",
-		"wmode"
-	};
-	char *argv[] = {
-		"application/x-shockwave-flash",
-		"Main",
-		"http://static-a.yahoo-mbga.jp/static/img/stdgame/300003/swf/main.swf?1343114848&ts=201503191400",
-		"flashfirebug",
-		"760",
-		"680",
-		"http://static-a.yahoo-mbga.jp/static/img/stdgame/300003/swf/main.swf?1343114848&ts=201503191400",
-		NULL,
-		"false",
-		"noScale",
-		"true",
-		"always",
-		"#FFFFFF",
-		"http://static-a.yahoo-mbga.jp/static/img/stdgame/300003/swf/?1343114848",
-		"ts=201503191400&httpApiHost=http://yahoo-mbga.jp",
-		"always",
-		"true",
-		"all",
-		"opaque"
-	};
-
-	np.ndata = b;
-	np.pdata = NULL;
-
-	logger_debug("start");
-
-	error = p->funcs.newp(pluginType, &np, mode, argc, argn, argv, NULL);
-	if (error != NPERR_NO_ERROR) {
-		logger_debug("newp %s", np_errorstr(error));
-		return;
-	}
-
-	error = p->funcs.destroy(&np, NULL);
-	if (error != NPERR_NO_ERROR) {
-		logger_debug("destroy %s", np_errorstr(error));
-		return;
-	}
-
-	logger_debug("end");
-}
 
 static void
 print_pluginfuncs(Plugin *p)
@@ -305,7 +237,7 @@ NPP_New_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 
 	buf_uint32_decode(&r, &len);
 	if (len) {
-		pluginType = buf_bytes_decode(&r, len);
+		pluginType = (char *)buf_bytes_decode(&r, len);
 	} else {
 		pluginType = NULL;
 	}
@@ -332,7 +264,7 @@ NPP_New_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 	for (i = 0; i < argc; i++) {
 		buf_uint32_decode(&r, &len);
 		if (len) {
-			argn[i] = buf_bytes_decode(&r, len);
+			argn[i] = (char *)buf_bytes_decode(&r, len);
 		} else {
 			argn[i] = NULL;
 		}
@@ -342,7 +274,7 @@ NPP_New_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 	for (i = 0; i < argc; i++) {
 		buf_uint32_decode(&r, &len);
 		if (len) {
-			argv[i] = buf_bytes_decode(&r, len);
+			argv[i] = (char *)buf_bytes_decode(&r, len);
 		} else {
 			argv[i] = NULL;
 		}
@@ -354,7 +286,7 @@ NPP_New_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 	} else {
 		saved = &saved_data;
 		saved->len = len;
-		saved->buf = buf_bytes_decode(&r, len);
+		saved->buf = (char *)buf_bytes_decode(&r, len);
 		logger_dump("saved", saved->buf, saved->len);
 	}
 
@@ -403,6 +335,9 @@ NPP_Destroy_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 
 	logger_debug("error: %s(%d)", np_errorstr(error), error);
 
+	if (error != NPERR_NO_ERROR)
+		npp_destroy(npp);
+
 	buf_writer_open(&w, 0);
 	buf_uint16_encode(&w, error);
 	if (saved) {
@@ -421,6 +356,478 @@ NPP_Destroy_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 
 	logger_debug("end");
 }
+
+static void
+NPP_SetWindow_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	BufWriter w;
+	uintptr_t ident;
+	NPP npp;
+	NPWindow *window;
+	NPWindow window_data;
+	NPSetWindowCallbackStruct ws_info_data;
+	NPError error;
+	uint32_t len;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	buf_uint32_decode(&r, &len);
+	if (len == 0) {
+		window = NULL;
+	} else {
+		window = &window_data;
+		logger_debug("window {");
+		buf_uint64_decode(&r, (uint64_t *)&window->window);
+		logger_debug("  window: %p", window->window);
+		buf_uint32_decode(&r, &window->x);
+		logger_debug("  x: %"PRId32, window->x);
+		buf_uint32_decode(&r, &window->y);
+		logger_debug("  y: %"PRId32, window->y);
+		buf_uint32_decode(&r, &window->width);
+		logger_debug("  width: %"PRIu32, window->width);
+		buf_uint32_decode(&r, &window->height);
+		logger_debug("  height: %"PRIu32, window->height);
+		logger_debug("  clipRect {");
+		buf_uint16_decode(&r, &window->clipRect.top);
+		logger_debug("    top: %"PRIu16, window->clipRect.top);
+		buf_uint16_decode(&r, &window->clipRect.left);
+		logger_debug("    left: %"PRIu16, window->clipRect.left);
+		buf_uint16_decode(&r, &window->clipRect.bottom);
+		logger_debug("    bottom: %"PRIu16, window->clipRect.bottom);
+		buf_uint16_decode(&r, &window->clipRect.right);
+		logger_debug("    right: %"PRIu16, window->clipRect.right);
+		logger_debug("  }");
+		buf_uint32_decode(&r, &len);
+		if (len == 0) {
+			window->ws_info = NULL;
+			logger_debug("  ws_info: %p", window->ws_info);
+		} else {
+			VisualID visualid;
+			GdkScreen *gdk_screen;
+			GdkDisplay *gdk_display;
+			GdkVisual *gdk_visual;
+			Display *display;
+
+			window->ws_info = &ws_info_data;
+			logger_debug("  ws_info: {");
+
+			buf_uint32_decode(&r, &ws_info_data.type);
+			logger_debug("    type: %"PRId32, ws_info_data.type);
+
+			buf_uint64_decode(&r, (uint64_t *)&display);
+			logger_debug("    display: %p", display);
+			if (display == NULL) {
+				ws_info_data.display = NULL;
+			} else {
+				gdk_screen = gdk_screen_get_default();
+				gdk_display = gdk_screen_get_display(gdk_screen);
+				ws_info_data.display = gdk_x11_display_get_xdisplay(
+						gdk_display);
+
+				logger_debug("    => display: %p", ws_info_data.display);
+			}
+
+			buf_uint64_decode(&r, &visualid);
+			logger_debug("      visualid: %lu", visualid);
+			if (display == NULL) {
+				ws_info_data.visual = NULL;
+			} else {
+				if (visualid == 0) {
+					gdk_visual = gdk_visual_get_system();
+				} else {
+					gdk_visual = gdk_x11_screen_lookup_visual(
+							gdk_screen, visualid);
+				}
+				ws_info_data.visual = gdk_x11_visual_get_xvisual(gdk_visual);
+			}
+			logger_debug("    visual: %p", ws_info_data.visual);
+
+			buf_uint64_decode(&r, &ws_info_data.colormap);
+			logger_debug("    colormap: %"PRIx64, ws_info_data.colormap);
+
+			buf_uint32_decode(&r, &ws_info_data.depth);
+			logger_debug("    depth: %u", ws_info_data.depth);
+
+			logger_debug("  }");
+		}
+		buf_uint32_decode(&r, &window->type);
+		logger_debug("  type: %"PRIu32, window->type);
+		logger_debug("}");
+	}
+
+	error = p->funcs.setwindow(npp, window);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	buf_writer_open(&w, 0);
+	buf_uint16_encode(&w, error);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPP_GetValue_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	BufWriter w;
+	uintptr_t ident;
+	NPP npp;
+	NPPVariable variable;
+	NPError error;
+	NPObject *npobj;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	buf_uint32_decode(&r, &variable);
+	logger_debug("variable: %s(%u)", npp_varstr(variable), variable);
+
+	buf_writer_open(&w, 0);
+
+	switch (variable) {
+	case NPPVpluginScriptableNPObject:
+		error = p->funcs.getvalue(npp, variable, (void *)&npobj);
+		logger_debug("error: %s(%d)", np_errorstr(error), error);
+		buf_uint16_encode(&w, error);
+		if (error == NPERR_NO_ERROR) {
+			logger_debug("npobj: %p", npobj);
+			buf_uint64_encode(&w, (uintptr_t)npobj);
+		}
+		break;
+	default:
+		error = NPERR_GENERIC_ERROR;
+		buf_uint16_encode(&w, error);
+		break;
+	}
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPP_NewStream_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	BufWriter w;
+	uintptr_t ident;
+	NPP npp;
+	char *type;
+	uintptr_t pdata;
+	uintptr_t ndata;
+	NPStream *stream;
+	NPBool seekable;
+	uint16_t stype;
+	NPError error;
+	uint32_t len;
+	const char *s;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	buf_uint32_decode(&r, &len);
+	if (len == 0) {
+		type = NULL;
+	} else {
+		type = (char *)buf_bytes_decode(&r, len);
+	}
+	logger_debug("type: '%s'", type);
+
+	logger_debug("stream {");
+	buf_uint64_decode(&r, (uint64_t *)&pdata);
+	logger_debug("  pdata: %p", pdata);
+	buf_uint64_decode(&r, (uint64_t *)&ndata);
+	logger_debug("  ndata: %p", ndata);
+
+	stream = npstream_create(ndata);
+	if (stream == NULL) {
+		logger_debug("npstream_create failed.");
+		return;
+	}
+	logger_debug("stream: %p", stream);
+	stream->ndata = (void *)ndata;
+
+	buf_uint32_decode(&r, &len);
+	if (len == 0) {
+		stream->url = NULL;
+	} else {
+		s = buf_bytes_decode(&r, len);
+		stream->url = strdup(s);
+	}
+	logger_debug("  url: '%s'", stream->url);
+
+	buf_uint32_decode(&r, &stream->end);
+	logger_debug("  end: %"PRIu32, stream->end);
+
+	buf_uint32_decode(&r, &stream->lastmodified);
+	logger_debug("  lastmodified: %"PRIu32, stream->lastmodified);
+
+	buf_uint64_decode(&r, (uint64_t *)&stream->notifyData);
+	logger_debug("  notifyData: %p", stream->notifyData);
+
+	buf_uint32_decode(&r, &len);
+	if (len == 0) {
+		stream->headers = NULL;
+	} else {
+		s = buf_bytes_decode(&r, len);
+		stream->headers = strdup(s);
+	}
+	logger_debug("  headers: '%s'", stream->headers);
+	logger_debug("}");
+
+	buf_uint8_decode(&r, &seekable);
+	logger_debug("seekable: %u", seekable);
+
+	error = p->funcs.newstream(npp, type, stream, seekable, &stype);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+	logger_debug("pdata: %p", stream->pdata);
+	logger_debug("notifyData: %p", stream->notifyData);
+	logger_debug("stype: %u", stype);
+
+	buf_writer_open(&w, 0);
+	buf_uint16_encode(&w, error);
+	buf_uint64_encode(&w, (uintptr_t)stream->pdata);
+	buf_uint64_encode(&w, (uintptr_t)stream->notifyData);
+	buf_uint16_encode(&w, stype);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPP_DestroyStream_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	BufWriter w;
+	uintptr_t ident;
+	NPP npp;
+	uintptr_t pdata;
+	uintptr_t ndata;
+	NPStream *stream;
+	NPReason reason;
+	NPError error;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	logger_debug("stream {");
+	buf_uint64_decode(&r, (uint64_t *)&pdata);
+	logger_debug("  pdata: %p", pdata);
+	buf_uint64_decode(&r, (uint64_t *)&ndata);
+	logger_debug("  ndata: %p", ndata);
+
+	stream = npstream_find(ndata);
+	if (stream == NULL) {
+		logger_debug("npstream_find failed.");
+		return;
+	}
+	logger_debug("stream: %p", stream);
+
+	buf_uint16_decode(&r, &reason);
+	logger_debug("reason: %u", reason);
+
+	error = p->funcs.destroystream(npp, stream, reason);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	if (error != NPERR_NO_ERROR)
+		npstream_destroy(stream);
+
+	buf_writer_open(&w, 0);
+	buf_uint16_encode(&w, error);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPP_WriteReady_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	BufWriter w;
+	uintptr_t ident;
+	NPP npp;
+	uintptr_t pdata;
+	uintptr_t ndata;
+	NPStream *stream;
+	int32_t ret;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	logger_debug("stream {");
+	buf_uint64_decode(&r, (uint64_t *)&pdata);
+	logger_debug("  pdata: %p", pdata);
+	buf_uint64_decode(&r, (uint64_t *)&ndata);
+	logger_debug("  ndata: %p", ndata);
+
+	stream = npstream_find(ndata);
+	if (stream == NULL) {
+		logger_debug("npstream_find failed.");
+		return;
+	}
+	logger_debug("stream: %p", stream);
+
+	ret = p->funcs.writeready(npp, stream);
+
+	logger_debug("ret: %"PRId32, ret);
+
+	buf_writer_open(&w, 0);
+	buf_uint32_encode(&w, ret);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPP_Write_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	BufWriter w;
+	uintptr_t ident;
+	NPP npp;
+	uintptr_t pdata;
+	uintptr_t ndata;
+	NPStream *stream;
+	int32_t offset;
+	void *buffer;
+	int32_t len;
+	int32_t ret;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	logger_debug("stream {");
+	buf_uint64_decode(&r, (uint64_t *)&pdata);
+	logger_debug("  pdata: %p", pdata);
+	buf_uint64_decode(&r, (uint64_t *)&ndata);
+	logger_debug("  ndata: %p", ndata);
+
+	stream = npstream_find(ndata);
+	if (stream == NULL) {
+		logger_debug("npstream_find failed.");
+		return;
+	}
+	logger_debug("stream: %p", stream);
+
+	buf_uint32_decode(&r, &offset);
+	logger_debug("offset: %"PRId32, offset);
+
+	buf_uint32_decode(&r, &len);
+	logger_debug("len: %"PRId32, len);
+	buffer = (void *)buf_bytes_decode(&r, len);
+	//logger_dump("buffer", buffer, len);
+
+	ret = p->funcs.write(npp, stream, offset, len, buffer);
+
+	logger_debug("ret: %"PRId32, ret);
+
+	buf_writer_open(&w, 0);
+	buf_uint32_encode(&w, ret);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
 
 static void
 np_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
@@ -450,6 +857,24 @@ np_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
 		break;
 	case RPC_NPP_Destroy:
 		NPP_Destroy_handle(p, b, sess, msg);
+		break;
+	case RPC_NPP_SetWindow:
+		NPP_SetWindow_handle(p, b, sess, msg);
+		break;
+	case RPC_NPP_GetValue:
+		NPP_GetValue_handle(p, b, sess, msg);
+		break;
+	case RPC_NPP_NewStream:
+		NPP_NewStream_handle(p, b, sess, msg);
+		break;
+	case RPC_NPP_DestroyStream:
+		NPP_DestroyStream_handle(p, b, sess, msg);
+		break;
+	case RPC_NPP_WriteReady:
+		NPP_WriteReady_handle(p, b, sess, msg);
+		break;
+	case RPC_NPP_Write:
+		NPP_Write_handle(p, b, sess, msg);
 		break;
 	default:
 		break;

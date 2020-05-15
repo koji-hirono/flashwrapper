@@ -19,7 +19,6 @@
 
 
 static Browser *g_browser = NULL;
-static NPClass npobj_class = {};
 
 
 static NPError
@@ -220,42 +219,33 @@ b_getvalue(NPP npp, NPNVariable variable, void *result)
 	case NPNVDOMWindow:
 		break;
 	case NPNVToolkit:
-		//*((NPNToolkitType *)result) = NPNVGtk2;
 		buf_uint32_decode(&r, result);
 		logger_debug("result: %u", *(NPNToolkitType *)result);
 		break;
 	case NPNVSupportsXEmbedBool:
-		/* falseだと失敗する */
-		//*(NPBool *)result = true;
 		buf_uint8_decode(&r, result);
 		logger_debug("result: %u", *(NPBool *)result);
 		break;
 	case NPNVWindowNPObject:
 		/* Get the NPObject wrapper for the browser window. */
-		/* TODO */
-		//*(NPObject **)result = &npobj_window;
 		buf_uint64_decode(&r, result);
 		logger_debug("result: %p", *(NPObject **)result);
 		break;
 	case NPNVPluginElementNPObject:
-		/* Get the NPObject wrapper for the plugins DOM element. */
 		buf_uint64_decode(&r, result);
 		logger_debug("result: %p", *(NPObject **)result);
 		break;
 	case NPNVSupportsWindowless:
-		//*(NPBool *)result = true;
 		buf_uint8_decode(&r, result);
 		logger_debug("result: %u", *(NPBool *)result);
 		break;
 	case NPNVprivateModeBool:
-		//*(NPBool *)result = false;
 		buf_uint8_decode(&r, result);
 		logger_debug("result: %u", *(NPBool *)result);
 		break;
         case NPNVsupportsAdvancedKeyHandling:
 		break;
         case NPNVdocumentOrigin:
-		//*(char **)result = strdup("http://yahoo-mbga.jp");
 		buf_uint32_decode(&r, &len);
 		if (len) {
 			s = buf_bytes_decode(&r, len);
@@ -270,7 +260,6 @@ b_getvalue(NPP npp, NPNVariable variable, void *result)
         case NPNVsupportsAsyncBitmapSurfaceBool:
                 break;
         case NPNVmuteAudioBool:
-                //*(NPBool *)result = false;
 		buf_uint8_decode(&r, result);
 		logger_debug("result: %u", *(NPBool *)result);
                 break;
@@ -354,20 +343,38 @@ b_forceredraw(NPP npp)
 static NPIdentifier
 b_getstringidentifier(const NPUTF8 *name)
 {
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_GetStringIdentifier,
+	};
+	BufWriter w;
+	BufReader r;
+	uint32_t len;
 	NPIdentifier ident;
 
-	logger_debug("start(%s)", name);
+	logger_debug("start");
 
-	if (strcmp(name, "location") == 0)
-		ident = (NPIdentifier)0x2;
-	else if (strcmp(name, "href") == 0)
-		ident = (NPIdentifier)0x3;
-	else if (strcmp(name, "top") == 0)
-		ident = (NPIdentifier)0x4;
-	else
-		ident = NULL;
+	logger_debug("name: '%s'", name);
 
-	logger_debug("end(%p)", ident);
+	buf_writer_open(&w, 0);
+	len = strlen(name) + 1;
+	buf_uint32_encode(&w, len);
+	buf_bytes_encode(&w, name, len);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(b->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint64_decode(&r, (uint64_t *)&ident);
+	logger_debug("ident: %p", ident);
+
+	free(msg.ret);
+
+	logger_debug("end");
 
 	return ident;
 }
@@ -512,49 +519,85 @@ b_evaluate(NPP npp, NPObject *npobj, NPString *script,
 	return false;
 }
 
-static NPObject npobj_location = {
-	._class = &npobj_class,
-	.referenceCount = 1
-};
-
-static NPObject npobj_top = {
-	._class = &npobj_class,
-	.referenceCount = 1
-};
-
-
 static bool
 b_getproperty(NPP npp, NPObject *npobj, NPIdentifier property,
 		NPVariant *result)
 {
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_GetProperty,
+	};
+	BufWriter w;
+	BufReader r;
+	bool ret;
+	NPString *npstr;
+	uint8_t u8;
+	uint32_t len;
+	const char *s;
+
 	logger_debug("start");
 	logger_debug("npp: :%p", npp);
 	logger_debug("npobj: :%p", npobj);
 	logger_debug("property: :%p", property);
 
-	switch ((uintptr_t)property) {
-	case 0x2:
-		result->type = NPVariantType_Object;
-		/* TODO */
-		result->value.objectValue = &npobj_location;
-		logger_debug("object: :%p", result->value.objectValue);
-		return true;
-	case 0x3:
-		result->type = NPVariantType_String;
-		result->value.stringValue.UTF8Characters = "http://yahoo-mbga.jp/stdgame/300003?member_id=&invite_member=&appParams=&code=";
-		result->value.stringValue.UTF8Length = strlen(
-				result->value.stringValue.UTF8Characters);
-		logger_debug("string: :%p", result->value.stringValue.UTF8Characters);
-		return true;
-	case 0x4:
-		result->type = NPVariantType_Object;
-		/* TODO */
-		result->value.objectValue = &npobj_top;
-		logger_debug("object: :%p", result->value.objectValue);
-		return true;
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+	buf_uint64_encode(&w, (uintptr_t)npobj);
+	buf_uint64_encode(&w, (uintptr_t)property);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(b->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint8_decode(&r, &u8);
+	ret = u8;
+	logger_debug("ret: %u", ret);
+
+	buf_uint32_decode(&r, &result->type);
+	logger_debug("result type: %u", result->type);
+	switch (result->type) {
+	case NPVariantType_Void:
+		logger_debug("void");
+		break;
+	case NPVariantType_Null:
+		logger_debug("null");
+		break;
+	case NPVariantType_Bool:
+		buf_uint8_decode(&r, &u8);
+		result->value.boolValue = u8;
+		logger_debug("bool: %u", result->value.boolValue);
+		break;
+	case NPVariantType_Int32:
+		buf_uint32_decode(&r, &result->value.intValue);
+		logger_debug("int: %"PRId32, result->value.intValue);
+		break;
+	case NPVariantType_Double:
+		buf_double_decode(&r, &result->value.doubleValue);
+		logger_debug("double: %f", result->value.doubleValue);
+		break;
+	case NPVariantType_String:
+		npstr = &result->value.stringValue;
+		buf_uint32_decode(&r, &len);
+		s = buf_bytes_decode(&r, len);
+		npstr->UTF8Length = len - 1;
+		npstr->UTF8Characters = strdup(s);
+		logger_debug("string: '%s'", npstr->UTF8Characters);
+		break;
+	case NPVariantType_Object:
+		buf_uint64_decode(&r, (uint64_t *)&result->value.objectValue);
+		logger_debug("object: %p", result->value.objectValue);
+		break;
 	}
 
-	return false;
+	free(msg.ret);
+
+	logger_debug("end");
+
+	return ret;
 }
 
 static bool
@@ -590,6 +633,22 @@ static void
 b_releasevariantvalue(NPVariant *variant)
 {
 	logger_debug("start(%p)", variant);
+
+	logger_debug("type: %u", variant->type);
+
+	switch (variant->type) {
+	case NPVariantType_Void:
+	case NPVariantType_Null:
+	case NPVariantType_Bool:
+	case NPVariantType_Int32:
+	case NPVariantType_Double:
+		break;
+	case NPVariantType_String:
+		free((void *)variant->value.stringValue.UTF8Characters);
+		break;
+	case NPVariantType_Object:
+		break;
+	}
 }
 
 static void
@@ -723,9 +782,6 @@ b_setcurrentasyncsurface(NPP instance, NPAsyncSurface *surface,
 
 #if 0
 #include <X11/Intrinsic.h>
-
-static Display *x_display;
-static XtAppContext x_app_context;
 #endif
 
 int
@@ -737,10 +793,15 @@ browser_init(Browser *b, RPCSess *sess)
 		"np_engine",
 		NULL
 	};
+	Display *x_display;
+	XtAppContext x_app_context;
+
 	XtToolkitInitialize();
 	x_app_context = XtCreateApplicationContext();
 	x_display = XtOpenDisplay(x_app_context, NULL,
 		       	"np_engine", "np_engine", NULL, 0, &argc, argv);
+	b->app_context = x_app_context;
+	b->display = x_display;
 #endif
 	gtk_init(NULL, NULL);
 #if 0
