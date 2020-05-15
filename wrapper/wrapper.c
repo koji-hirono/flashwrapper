@@ -39,12 +39,18 @@ static void
 NPN_UserAgent_handle(Wrapper *wrapper, RPCMsg *msg)
 {
 	RPCSess *sess = &wrapper->sess;
-	NPP instance = NULL;
+	NPP instance;
+	BufReader r;
 	BufWriter w;
 	uint32_t len;
 	const char *s;
 
 	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+	buf_uint64_decode(&r, &instance);
+
+	logger_debug("instance: %p");
 
 	s = wrapper->bfuncs->uagent(instance);
 
@@ -73,7 +79,7 @@ static void
 NPN_GetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 {
 	RPCSess *sess = &wrapper->sess;
-	NPP instance = NULL;
+	NPP instance;
 	BufWriter w;
 	BufReader r;
 	NPNVariable variable;
@@ -87,6 +93,10 @@ NPN_GetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 	logger_debug("start");
 
 	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &instance);
+	logger_debug("instance: %p");
+
 	if (buf_uint32_decode(&r, &variable) == NULL) {
 		logger_debug("buf_uint32_decode failed.");
 		return;
@@ -152,6 +162,88 @@ NPN_GetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 }
 
 static void
+NPN_SetValue_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->sess;
+	NPP instance;
+	BufWriter w;
+	BufReader r;
+	NPPVariable variable;
+	NPError error;
+	NPBool boolval;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+	buf_uint64_decode(&r, &instance);
+
+	logger_debug("instance: %p", instance);
+
+	if (buf_uint32_decode(&r, &variable) == NULL) {
+		logger_debug("buf_uint32_decode failed.");
+		return;
+	}
+
+	logger_debug("variable: [%u]%s", variable, npp_varstr(variable));
+
+	buf_writer_open(&w, 0);
+
+	switch (variable) {
+	case NPPVpluginWindowBool:
+	case NPPVpluginTransparentBool:
+		if (buf_uint8_decode(&r, &boolval) == NULL) {
+			logger_debug("buf_uint8_decode failed.");
+			return;
+		}
+		logger_debug("value: %u", boolval);
+		error = wrapper->bfuncs->setvalue(instance, variable,
+				boolval ? &boolval : NULL);
+		logger_debug("error: %s(%d)", np_errorstr(error), error);
+		buf_uint16_encode(&w, error);
+		break;
+	default:
+		logger_debug("unknown variable: %d", variable);
+		error = NPERR_GENERIC_ERROR;
+		buf_uint16_encode(&w, error);
+		break;
+	}
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPN_ReleaseObject_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->sess;
+	BufReader r;
+	NPObject *npobj;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+	if (buf_uint64_decode(&r, &npobj) == NULL) {
+		logger_debug("buf_uint64_decode failed.");
+		return;
+	}
+
+	logger_debug("npobj: %p", npobj);
+
+	wrapper->bfuncs->releaseobject(npobj);
+
+	rpc_return(sess, msg);
+
+	logger_debug("end");
+}
+
+
+static void
 npn_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
 {
 	Wrapper *wrapper = ctxt;
@@ -164,6 +256,10 @@ npn_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
 		NPN_GetValue_handle(wrapper, msg);
 		break;
 	case RPC_NPN_SetValue:
+		NPN_SetValue_handle(wrapper, msg);
+		break;
+	case RPC_NPN_ReleaseObject:
+		NPN_ReleaseObject_handle(wrapper, msg);
 		break;
 	default:
 		break;
@@ -372,6 +468,7 @@ pNPP_New(NPMIMEType pluginType, NPP instance, uint16_t mode,
 		buf_uint32_encode(&w, 0);
 	}
 	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
+	buf_uint64_encode(&w, (uintptr_t)instance);
 	logger_debug("mode: %u", mode);
 	buf_uint16_encode(&w, mode);
 	logger_debug("argc: %u", argc);
@@ -455,8 +552,12 @@ pNPP_Destroy(NPP instance, NPSavedData **save)
 	RPCMsg msg = {
 		.method = RPC_NPP_Destroy,
 	};
+	BufWriter w;
 	BufReader r;
 	NPError error;
+	NPSavedData *saved;
+	uint32_t len;
+	void *data;
 
 	logger_debug("start");
 
@@ -469,7 +570,15 @@ pNPP_Destroy(NPP instance, NPSavedData **save)
 	if (save && *save)
 		logger_dump("*save", (*save)->buf, (*save)->len);
 
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, (uintptr_t)instance);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
 	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
 
 	buf_reader_init(&r, msg.ret, msg.ret_size);
 	if (buf_uint16_decode(&r, &error) == NULL) {
@@ -479,6 +588,26 @@ pNPP_Destroy(NPP instance, NPSavedData **save)
 
 	if (error != NPERR_NO_ERROR)
 		return error;
+
+	if (buf_uint32_decode(&r, &len) == NULL) {
+		logger_debug("buf_uint16_decode failed.");
+		return NPERR_GENERIC_ERROR;
+	}
+
+	if (len) {
+		data = buf_bytes_decode(&r, len);
+		saved = malloc(sizeof(*saved));
+		if (saved != NULL) {
+			saved->len = len;
+			saved->buf = malloc(len);
+			if (saved->buf == NULL) {
+				free(saved);
+			} else {
+				memcpy(saved->buf, data, len);
+				*save = saved;
+			}
+		}
+	}
 
 	free(instance->pdata);
 
