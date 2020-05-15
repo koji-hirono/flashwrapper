@@ -3,6 +3,7 @@ SRCS:=main.c
 SRCS+=plugin.c
 SRCS+=browser.c
 SRCS+=npp.c
+SRCS+=npstream.c
 SRCS+=../common/rpc.c
 SRCS+=../common/buf.c
 SRCS+=../common/util.c
