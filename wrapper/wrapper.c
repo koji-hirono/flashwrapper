@@ -14,6 +14,7 @@
 #include "util.h"
 #include "buf.h"
 #include "rpc.h"
+#include "npobject.h"
 #include "engine.h"
 
 
@@ -48,7 +49,7 @@ NPN_UserAgent_handle(Wrapper *wrapper, RPCMsg *msg)
 	logger_debug("start");
 
 	buf_reader_init(&r, msg->param, msg->param_size);
-	buf_uint64_decode(&r, &instance);
+	buf_uint64_decode(&r, (uint64_t *)&instance);
 
 	logger_debug("instance: %p");
 
@@ -94,7 +95,7 @@ NPN_GetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 
 	buf_reader_init(&r, msg->param, msg->param_size);
 
-	buf_uint64_decode(&r, &instance);
+	buf_uint64_decode(&r, (uint64_t *)&instance);
 	logger_debug("instance: %p");
 
 	if (buf_uint32_decode(&r, &variable) == NULL) {
@@ -175,7 +176,7 @@ NPN_SetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 	logger_debug("start");
 
 	buf_reader_init(&r, msg->param, msg->param_size);
-	buf_uint64_decode(&r, &instance);
+	buf_uint64_decode(&r, (uint64_t *)&instance);
 
 	logger_debug("instance: %p", instance);
 
@@ -228,7 +229,7 @@ NPN_ReleaseObject_handle(Wrapper *wrapper, RPCMsg *msg)
 	logger_debug("start");
 
 	buf_reader_init(&r, msg->param, msg->param_size);
-	if (buf_uint64_decode(&r, &npobj) == NULL) {
+	if (buf_uint64_decode(&r, (uint64_t *)&npobj) == NULL) {
 		logger_debug("buf_uint64_decode failed.");
 		return;
 	}
@@ -242,6 +243,121 @@ NPN_ReleaseObject_handle(Wrapper *wrapper, RPCMsg *msg)
 	logger_debug("end");
 }
 
+static void
+NPN_GetStringIdentifier_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->sess;
+	BufReader r;
+	BufWriter w;
+	uint32_t len;
+	const char *s;
+	NPIdentifier id;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+	buf_uint32_decode(&r, &len);
+	if (len == 0)
+		s = NULL;
+	else
+		s = buf_bytes_decode(&r, len);
+
+	logger_debug("name: %s", s);
+
+	id = wrapper->bfuncs->getstringidentifier(s);
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, (uintptr_t)id);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPN_GetProperty_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->sess;
+	BufReader r;
+	BufWriter w;
+	NPP instance;
+	NPObject *npobj;
+	NPIdentifier property;
+	NPVariant result;
+	NPString *stringValue;
+	bool ret;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, (uint64_t *)&instance);
+	logger_debug("instance: %p", instance);
+
+	buf_uint64_decode(&r, (uint64_t *)&npobj);
+	logger_debug("npobj: %p", npobj);
+
+	buf_uint64_decode(&r, (uint64_t *)&property);
+	logger_debug("property: %p", property);
+
+	VOID_TO_NPVARIANT(result);
+
+	ret = wrapper->bfuncs->getproperty(instance, npobj, property, &result);
+
+	logger_debug("ret: %u", ret);
+
+	buf_writer_open(&w, 0);
+	buf_uint8_encode(&w, ret);
+
+	buf_uint32_encode(&w, result.type);
+	switch (result.type) {
+	case NPVariantType_Void:
+		logger_debug("void");
+		break;
+	case NPVariantType_Null:
+		logger_debug("null");
+		break;
+	case NPVariantType_Bool:
+		logger_debug("bool: %u", result.value.boolValue);
+		buf_uint8_encode(&w, result.value.boolValue);
+		break;
+	case NPVariantType_Int32:
+		logger_debug("int: %"PRId32, result.value.intValue);
+		buf_uint32_encode(&w, result.value.intValue);
+		break;
+	case NPVariantType_Double:
+		logger_debug("double: %f", result.value.doubleValue);
+		buf_double_encode(&w, result.value.doubleValue);
+		break;
+	case NPVariantType_String:
+		stringValue = &result.value.stringValue;
+		logger_debug("string: %s", stringValue->UTF8Characters);
+		buf_uint32_encode(&w, stringValue->UTF8Length + 1);
+		buf_bytes_encode(&w, stringValue->UTF8Characters,
+				stringValue->UTF8Length + 1);
+		break;
+	case NPVariantType_Object:
+		logger_debug("object: %p", result.value.objectValue);
+		buf_uint64_encode(&w, (uintptr_t)result.value.objectValue);
+		break;
+	default:
+		break;
+	}
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
 
 static void
 npn_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
@@ -260,6 +376,12 @@ npn_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
 		break;
 	case RPC_NPN_ReleaseObject:
 		NPN_ReleaseObject_handle(wrapper, msg);
+		break;
+	case RPC_NPN_GetStringIdentifier:
+		NPN_GetStringIdentifier_handle(wrapper, msg);
+		break;
+	case RPC_NPN_GetProperty:
+		NPN_GetProperty_handle(wrapper, msg);
 		break;
 	default:
 		break;
@@ -516,24 +638,12 @@ pNPP_New(NPMIMEType pluginType, NPP instance, uint16_t mode,
 		return NPERR_GENERIC_ERROR;
 	}
 
+	free(msg.ret);
+
 	if (error != NPERR_NO_ERROR)
 		return error;
 
 	instance->pdata = malloc(sizeof(Plugin));
-
-#if 0
-	print_variables(wrapper->bfuncs, instance);
-
-	NPError e;
-	NPBool b;
-	b = true;
-	e = wrapper->bfuncs->setvalue(instance, NPPVpluginWindowBool, &b);
-	logger_debug("setvalue: %d", e);
-
-	b = true;
-	e = wrapper->bfuncs->setvalue(instance, NPPVpluginTransparentBool, &b);
-	logger_debug("setvalue: %d", e);
-#endif
 
 	if (saved) {
 		free(saved->buf);
@@ -557,7 +667,7 @@ pNPP_Destroy(NPP instance, NPSavedData **save)
 	NPError error;
 	NPSavedData *saved;
 	uint32_t len;
-	void *data;
+	const void *data;
 
 	logger_debug("start");
 
@@ -618,73 +728,259 @@ pNPP_Destroy(NPP instance, NPSavedData **save)
 static NPError
 pNPP_SetWindow(NPP instance, NPWindow *window)
 {
+	Wrapper *wrapper;
+	RPCSess *sess;
+	RPCMsg msg = {
+		.method = RPC_NPP_SetWindow,
+	};
+	BufReader r;
+	BufWriter w;
+	NPSetWindowCallbackStruct *ws_info;
+	VisualID visualid;
+	NPError error;
+
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
-	logger_debug("window: {");
-	logger_debug("  window: %p", window->window);
-	logger_debug("  x: %"PRId32, window->x);
-	logger_debug("  y: %"PRId32, window->y);
-	logger_debug("  width: %"PRIu32, window->width);
-	logger_debug("  height: %"PRIu32, window->height);
-	logger_debug("  clipRect: {");
-	logger_debug("    top: %"PRIu16, window->clipRect.top);
-	logger_debug("    left: %"PRIu16, window->clipRect.left);
-	logger_debug("    bottom: %"PRIu16, window->clipRect.bottom);
-	logger_debug("    right: %"PRIu16, window->clipRect.right);
-	logger_debug("  }");
-	logger_debug("  ws_info: %p", window->ws_info);
-	logger_debug("  type: %d", window->type);
-	logger_debug("}");
+
+	wrapper = wrapper_get();
+	if (wrapper == NULL)
+		return NPERR_GENERIC_ERROR;
+
+	sess = &wrapper->sess;
+
+	buf_writer_open(&w, 0);
+
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
+	buf_uint64_encode(&w, (uintptr_t)instance);
+
+	if (window) {
+		logger_debug("window: {");
+		logger_debug("  window: %p", window->window);
+		logger_debug("  x: %"PRId32, window->x);
+		logger_debug("  y: %"PRId32, window->y);
+		logger_debug("  width: %"PRIu32, window->width);
+		logger_debug("  height: %"PRIu32, window->height);
+		logger_debug("  clipRect: {");
+		logger_debug("    top: %"PRIu16, window->clipRect.top);
+		logger_debug("    left: %"PRIu16, window->clipRect.left);
+		logger_debug("    bottom: %"PRIu16, window->clipRect.bottom);
+		logger_debug("    right: %"PRIu16, window->clipRect.right);
+		logger_debug("  }");
+		logger_debug("  ws_info: %p", window->ws_info);
+		ws_info = window->ws_info;
+		if (ws_info) {
+			logger_debug("    type: %"PRId32, ws_info->type);
+			logger_debug("    display: %p", ws_info->display);
+			logger_debug("    visual: %p", ws_info->visual);
+			logger_debug("    colormap: %"PRIx64, ws_info->colormap);
+			logger_debug("    depth: %u", ws_info->depth);
+		}
+		logger_debug("  type: %d", window->type);
+		logger_debug("}");
+		buf_uint32_encode(&w, sizeof(*window));
+		buf_uint64_encode(&w, (uintptr_t)window->window);
+		buf_uint32_encode(&w, window->x);
+		buf_uint32_encode(&w, window->y);
+		buf_uint32_encode(&w, window->width);
+		buf_uint32_encode(&w, window->height);
+		buf_uint16_encode(&w, window->clipRect.top);
+		buf_uint16_encode(&w, window->clipRect.left);
+		buf_uint16_encode(&w, window->clipRect.bottom);
+		buf_uint16_encode(&w, window->clipRect.right);
+		if (ws_info) {
+			buf_uint32_encode(&w, sizeof(*ws_info));
+			buf_uint32_encode(&w, ws_info->type);
+			buf_uint64_encode(&w, (uintptr_t)ws_info->display);
+			/* Visual -> Visual ID */
+			if (ws_info->visual) {
+				visualid = XVisualIDFromVisual(ws_info->visual);
+			} else {
+				visualid = 0;
+			}
+			logger_debug("    visualID: %lu", visualid);
+			buf_uint64_encode(&w, visualid);
+			buf_uint64_encode(&w, ws_info->colormap);
+			buf_uint32_encode(&w, ws_info->depth);
+		} else {
+			buf_uint32_encode(&w, 0);
+		}
+		buf_uint32_encode(&w, window->type);
+	} else {
+		buf_uint32_encode(&w, 0);
+	}
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint16_decode(&r, &error);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	free(msg.ret);
+
 	logger_debug("end");
-	return NPERR_NO_ERROR;
+	return error;
 }
 
 static NPError
 pNPP_NewStream(NPP instance, NPMIMEType type, NPStream *stream,
 		NPBool seekable, uint16_t *stype)
 {
+	Wrapper *wrapper;
+	RPCMsg msg = {
+		.method = RPC_NPP_NewStream,
+	};
+	BufWriter w;
+	BufReader r;
+	NPError error;
+	uint32_t len;
+
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
+
+	wrapper = wrapper_get();
+	if (wrapper == NULL)
+		return NPERR_GENERIC_ERROR;
+
+	buf_writer_open(&w, 0);
+
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
+	buf_uint64_encode(&w, (uintptr_t)instance);
+
 	logger_debug("type: '%s'", type);
+	if (type) {
+		len = strlen(type) + 1;
+		buf_uint32_encode(&w, len);
+		buf_bytes_encode(&w, type, len);
+	} else {
+		buf_uint32_encode(&w, 0);
+	}
+
 	logger_debug("stream {");
 	logger_debug("  pdata: %p", stream->pdata);
+	buf_uint64_encode(&w, (uintptr_t)stream->pdata);
 	logger_debug("  ndata: %p", stream->ndata);
+	buf_uint64_encode(&w, (uintptr_t)stream->ndata);
 	logger_debug("  url: '%s'", stream->url);
+	if (stream->url) {
+		len = strlen(stream->url) + 1;
+		buf_uint32_encode(&w, len);
+		buf_bytes_encode(&w, stream->url, len);
+	} else {
+		buf_uint32_encode(&w, 0);
+	}
 	logger_debug("  end: %"PRIu32, stream->end);
+	buf_uint32_encode(&w, stream->end);
 	logger_debug("  lastmodified: %"PRIu32, stream->lastmodified);
+	buf_uint32_encode(&w, stream->lastmodified);
 	logger_debug("  notifyData: %p", stream->notifyData);
+	buf_uint64_encode(&w, (uintptr_t)stream->notifyData);
 	logger_debug("  headers: '%s'", stream->headers);
+	if (stream->headers) {
+		len = strlen(stream->headers) + 1;
+		buf_uint32_encode(&w, len);
+		buf_bytes_encode(&w, stream->headers, len);
+	} else {
+		buf_uint32_encode(&w, 0);
+	}
 	logger_debug("}");
-	logger_debug("seekable: %d", seekable);
-	logger_debug("stype: %p", stype);
+
+	logger_debug("seekable: %u", seekable);
+	buf_uint8_encode(&w, seekable);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint16_decode(&r, &error);
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+	buf_uint64_decode(&r, (uint64_t *)&stream->pdata);
+	logger_debug("pdata: %p", stream->pdata);
+	buf_uint64_decode(&r, (uint64_t *)&stream->notifyData);
+	logger_debug("notifyData: %p", stream->notifyData);
+	buf_uint16_decode(&r, stype);
+	logger_debug("stype: %u", *stype);
+
+	free(msg.ret);
+
 	logger_debug("end");
-	return NPERR_NO_ERROR;
+	return error;
 }
 
 static NPError
 pNPP_DestroyStream(NPP instance, NPStream *stream, NPReason reason)
 {
+	Wrapper *wrapper;
+	RPCMsg msg = {
+		.method = RPC_NPP_DestroyStream,
+	};
+	BufWriter w;
+	BufReader r;
+	NPError error;
+
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
+
+	wrapper = wrapper_get();
+	if (wrapper == NULL)
+		return NPERR_GENERIC_ERROR;
+
+	buf_writer_open(&w, 0);
+
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
+	buf_uint64_encode(&w, (uintptr_t)instance);
+
 	logger_debug("stream {");
 	logger_debug("  pdata: %p", stream->pdata);
+	buf_uint64_encode(&w, (uintptr_t)stream->pdata);
 	logger_debug("  ndata: %p", stream->ndata);
+	buf_uint64_encode(&w, (uintptr_t)stream->ndata);
 	logger_debug("  url: '%s'", stream->url);
 	logger_debug("  end: %"PRIu32, stream->end);
 	logger_debug("  lastmodified: %"PRIu32, stream->lastmodified);
 	logger_debug("  notifyData: %p", stream->notifyData);
 	logger_debug("  headers: '%s'", stream->headers);
 	logger_debug("}");
+
 	logger_debug("reason: %u", reason);
+	buf_uint16_encode(&w, reason);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint16_decode(&r, &error);
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	free(msg.ret);
+
 	logger_debug("end");
-	return NPERR_NO_ERROR;
+	return error;
 }
 
 static void
 pNPP_StreamAsFile(NPP instance, NPStream *stream, const char *fname)
 {
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
 	logger_debug("stream {");
 	logger_debug("  pdata: %p", stream->pdata);
 	logger_debug("  ndata: %p", stream->ndata);
@@ -701,41 +997,117 @@ pNPP_StreamAsFile(NPP instance, NPStream *stream, const char *fname)
 static int32_t
 pNPP_WriteReady(NPP instance, NPStream *stream)
 {
+	Wrapper *wrapper;
+	RPCMsg msg = {
+		.method = RPC_NPP_WriteReady,
+	};
+	BufWriter w;
+	BufReader r;
+	int32_t ret;
+
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
+
+	wrapper = wrapper_get();
+	if (wrapper == NULL)
+		return NPERR_GENERIC_ERROR;
+
+	buf_writer_open(&w, 0);
+
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
+	buf_uint64_encode(&w, (uintptr_t)instance);
+
 	logger_debug("stream {");
 	logger_debug("  pdata: %p", stream->pdata);
+	buf_uint64_encode(&w, (uintptr_t)stream->pdata);
 	logger_debug("  ndata: %p", stream->ndata);
+	buf_uint64_encode(&w, (uintptr_t)stream->ndata);
 	logger_debug("  url: '%s'", stream->url);
 	logger_debug("  end: %"PRIu32, stream->end);
 	logger_debug("  lastmodified: %"PRIu32, stream->lastmodified);
 	logger_debug("  notifyData: %p", stream->notifyData);
 	logger_debug("  headers: '%s'", stream->headers);
 	logger_debug("}");
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint32_decode(&r, &ret);
+	logger_debug("ret: %"PRId32, ret);
+
+	free(msg.ret);
+
 	logger_debug("end");
-	return 0;
+
+	return ret;
 }
 
 static int32_t
 pNPP_Write(NPP instance, NPStream *stream, int32_t offset,
 		int32_t len, void *buffer)
 {
+	Wrapper *wrapper;
+	RPCMsg msg = {
+		.method = RPC_NPP_Write,
+	};
+	BufWriter w;
+	BufReader r;
+	int32_t ret;
+
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
+
+	wrapper = wrapper_get();
+	if (wrapper == NULL)
+		return NPERR_GENERIC_ERROR;
+
+	buf_writer_open(&w, 0);
+
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
+	buf_uint64_encode(&w, (uintptr_t)instance);
+
 	logger_debug("stream {");
 	logger_debug("  pdata: %p", stream->pdata);
+	buf_uint64_encode(&w, (uintptr_t)stream->pdata);
 	logger_debug("  ndata: %p", stream->ndata);
+	buf_uint64_encode(&w, (uintptr_t)stream->ndata);
 	logger_debug("  url: '%s'", stream->url);
 	logger_debug("  end: %"PRIu32, stream->end);
 	logger_debug("  lastmodified: %"PRIu32, stream->lastmodified);
 	logger_debug("  notifyData: %p", stream->notifyData);
 	logger_debug("  headers: '%s'", stream->headers);
 	logger_debug("}");
-	logger_debug("end");
+
 	logger_debug("offset: %"PRId32, offset);
-	logger_dump("buffer", buffer, len);
+	buf_uint32_encode(&w, offset);
+	logger_debug("len: %"PRId32, len);
+	buf_uint32_encode(&w, len);
+	//logger_dump("buffer", buffer, len);
+	buf_bytes_encode(&w, buffer, len);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint32_decode(&r, &ret);
+	logger_debug("ret: %"PRId32, ret);
+
+	free(msg.ret);
+
 	logger_debug("end");
-	return 0;
+
+	return ret;
 }
 
 static void
@@ -767,10 +1139,29 @@ pNPP_Print(NPP instance, NPPrint *platformPrint)
 static int16_t
 pNPP_HandleEvent(NPP instance, void *event)
 {
+	NPEvent *npevent = event;
+
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
+
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
+
 	logger_debug("event: %p", event);
+	logger_debug("  type: %d", npevent->type);
+	switch (npevent->type) {
+	case GraphicsExpose:
+		logger_debug("expose");
+		break;
+	case ButtonPress:
+		logger_debug("button");
+		break;
+	default:
+		break;
+	}
+
 	logger_debug("end");
+
 	return 0;
 }
 
@@ -788,9 +1179,29 @@ pNPP_URLNotify(NPP instance, const char *url, NPReason reason, void *notifyData)
 static NPError
 pNPP_GetValue(NPP instance, NPPVariable variable, void *ret_value)
 {
+	Wrapper *wrapper;
+	RPCSess *sess;
+	RPCMsg msg = {
+		.method = RPC_NPP_GetValue,
+	};
+	BufReader r;
+	BufWriter w;
+	NPError error;
+	uintptr_t ident;
+	NPObject *npobj;
+
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
-	logger_debug("variable: %u", variable);
+
+	wrapper = wrapper_get();
+	if (wrapper == NULL)
+		return NPERR_GENERIC_ERROR;
+
+	sess = &wrapper->sess;
+
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
+	logger_debug("variable: %s(%u)", npp_varstr(variable), variable);
 	logger_debug("ret_value: %p", ret_value);
 
 	switch (variable) {
@@ -798,9 +1209,49 @@ pNPP_GetValue(NPP instance, NPPVariable variable, void *ret_value)
 	case NPPVpluginDescriptionString:
 		return NP_GetValue(NULL, variable, ret_value);
 	default:
-		logger_debug("end");
+		break;
+	}
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, (uintptr_t)instance);
+	buf_uint32_encode(&w, variable);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint16_decode(&r, &error);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+	if (error != NPERR_NO_ERROR) {
+		free(msg.ret);
+		return error;
+	}
+
+	switch (variable) {
+	case NPPVpluginScriptableNPObject:
+		buf_uint64_decode(&r, (uint64_t *)&ident);
+		logger_debug("ident: %p", ident);
+		npobj = npobject_find(ident);
+		if (!npobj) {
+			npobj = npobject_create(ident);
+		}
+		logger_debug("npobj: %p", npobj);
+		*(NPObject **)ret_value = npobj;
+		break;
+	default:
+		free(msg.ret);
 		return NPERR_GENERIC_ERROR;
 	}
+
+	free(msg.ret);
+
+	logger_debug("end");
+	return error;
 }
 
 static NPError
@@ -876,6 +1327,9 @@ NP_Initialize(NPNetscapeFuncs *bfuncs, NPPluginFuncs *pfuncs)
 		logger_debug("buf_uint16_decode failed.");
 		return NPERR_GENERIC_ERROR;
 	}
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	free(msg.ret);
 
 	if (error != NPERR_NO_ERROR)
 		return error;
@@ -929,6 +1383,9 @@ NP_Shutdown(void)
 		logger_debug("buf_uint16_decode failed.");
 		return NPERR_GENERIC_ERROR;
 	}
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	free(msg.ret);
 
 	if (error != NPERR_NO_ERROR)
 		return error;
