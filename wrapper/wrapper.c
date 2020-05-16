@@ -792,6 +792,7 @@ pNPP_SetWindow(NPP instance, NPWindow *window)
 			buf_uint32_encode(&w, sizeof(*ws_info));
 			buf_uint32_encode(&w, ws_info->type);
 			buf_uint64_encode(&w, (uintptr_t)ws_info->display);
+			buf_uint64_encode(&w, (uintptr_t)ws_info->visual);
 			/* Visual -> Visual ID */
 			if (ws_info->visual) {
 				visualid = XVisualIDFromVisual(ws_info->visual);
