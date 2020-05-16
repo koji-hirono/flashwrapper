@@ -419,6 +419,7 @@ NPP_SetWindow_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 			GdkDisplay *gdk_display;
 			GdkVisual *gdk_visual;
 			Display *display;
+			Visual *visual;
 
 			window->ws_info = &ws_info_data;
 			logger_debug("  ws_info: {");
@@ -439,9 +440,11 @@ NPP_SetWindow_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 				logger_debug("    => display: %p", ws_info_data.display);
 			}
 
+			buf_uint64_decode(&r, (uint64_t *)&visual);
+			logger_debug("      visual: %p", visual);
 			buf_uint64_decode(&r, &visualid);
 			logger_debug("      visualid: %lu", visualid);
-			if (display == NULL) {
+			if (visual == NULL) {
 				ws_info_data.visual = NULL;
 			} else {
 				if (visualid == 0) {
@@ -470,6 +473,33 @@ NPP_SetWindow_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 	error = p->funcs.setwindow(npp, window);
 
 	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	if (window) {
+		logger_debug("after window {");
+		logger_debug("  window: %p", window->window);
+		logger_debug("  x: %"PRId32, window->x);
+		logger_debug("  y: %"PRId32, window->y);
+		logger_debug("  width: %"PRIu32, window->width);
+		logger_debug("  height: %"PRIu32, window->height);
+		logger_debug("  clipRect {");
+		logger_debug("    top: %"PRIu16, window->clipRect.top);
+		logger_debug("    left: %"PRIu16, window->clipRect.left);
+		logger_debug("    bottom: %"PRIu16, window->clipRect.bottom);
+		logger_debug("    right: %"PRIu16, window->clipRect.right);
+		logger_debug("  }");
+		logger_debug("  ws_info: %p", window->ws_info);
+		if (window->ws_info) {
+			logger_debug("  ws_info: {");
+			logger_debug("    type: %"PRId32, ws_info_data.type);
+			logger_debug("    display: %p", ws_info_data.display);
+			logger_debug("    visual: %p", ws_info_data.visual);
+			logger_debug("    colormap: %"PRIx64, ws_info_data.colormap);
+			logger_debug("    depth: %u", ws_info_data.depth);
+			logger_debug("  }");
+		}
+		logger_debug("  type: %"PRIu32, window->type);
+		logger_debug("}");
+	}
 
 	buf_writer_open(&w, 0);
 	buf_uint16_encode(&w, error);
