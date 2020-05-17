@@ -23,6 +23,7 @@ struct RPCMsg {
 
 struct RPCSess {
 	int fd;
+	RPCSess *alt;
 	void (*dispatch)(RPCSess *, RPCMsg *, void *);
 	void *ctxt;
 };
@@ -133,7 +134,8 @@ struct RPCSess {
 extern int rpcmsghdr_encode(RPCMsgHdr *, void *, size_t);
 extern int rpcmsghdr_decode(RPCMsgHdr *, const void *, size_t);
 
-extern void rpcsess_init(RPCSess *, int, void (*)(RPCSess *, RPCMsg *, void *), void *);
+extern void rpcsess_init(RPCSess *, int, RPCSess *,
+		void (*)(RPCSess *, RPCMsg *, void *), void *);
 extern int rpc_invoke(RPCSess *, RPCMsg *);
 extern int rpc_handle(RPCSess *);
 extern int rpc_return(RPCSess *, RPCMsg *);

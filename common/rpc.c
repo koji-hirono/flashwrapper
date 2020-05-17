@@ -5,6 +5,7 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
 
 #include "logger.h"
 #include "rpc.h"
@@ -110,10 +111,12 @@ rpcmsghdr_decode(RPCMsgHdr *hdr, const void *buf, size_t size)
 }
 
 void
-rpcsess_init(RPCSess *sess, int fd, void (*dispatch)(RPCSess *, RPCMsg *, void *),
+rpcsess_init(RPCSess *sess, int fd, RPCSess *alt,
+		void (*dispatch)(RPCSess *, RPCMsg *, void *),
 		void *ctxt)
 {
 	sess->fd = fd;
+	sess->alt = alt;
 	sess->dispatch = dispatch;
 	sess->ctxt = ctxt;
 }
@@ -125,6 +128,9 @@ rpc_invoke(RPCSess *sess, RPCMsg *msg)
 	RPCMsgHdr hdr;
 	RPCMsg req;
 	void *data;
+	struct pollfd pfds[2];
+	nfds_t nfds;
+	int r;
 
 	hdr.type = RPCTypeRequest;
 	hdr.method = msg->method;
@@ -143,42 +149,91 @@ rpc_invoke(RPCSess *sess, RPCMsg *msg)
 		}
 	}
 
+	pfds[0].fd = sess->fd;
+	pfds[0].events = POLLIN;
+	nfds = 1;
+	if (sess->alt) {
+		pfds[1].fd = sess->alt->fd;
+		pfds[1].events = POLLIN;
+		nfds++;
+	}
+
 	for (;;) {
-		if (rpc_recv(sess, buf, sizeof(buf)) != 0) {
-			logger_debug("rpc_recv header failed.");
+		logger_debug("suspend");
+		r = poll(pfds, nfds, -1);
+		if (r == -1) {
+			logger_debug("poll failed. %s", strerror(errno));
 			return -1;
 		}
+		if (r == 0) {
+			logger_debug("poll timeout");
+			return -1;
+		}
+		logger_debug("resume");
 
-		rpcmsghdr_decode(&hdr, buf, sizeof(buf));
-
-		if (hdr.size) {
-			data = malloc(hdr.size);
-			if (data == NULL)
+		if (pfds[0].revents & POLLIN) {
+			if (rpc_recv(sess, buf, sizeof(buf)) != 0) {
+				logger_debug("rpc_recv header failed.");
 				return -1;
-			if (rpc_recv(sess, data, hdr.size) != 0) {
-				logger_debug("rpc_recv failed.");
+			}
+
+			rpcmsghdr_decode(&hdr, buf, sizeof(buf));
+
+			if (hdr.size) {
+				data = malloc(hdr.size);
+				if (data == NULL)
+					return -1;
+				if (rpc_recv(sess, data, hdr.size) != 0) {
+					logger_debug("rpc_recv failed.");
+					free(data);
+					return -1;
+				}
+			} else {
+				data = NULL;
+			}
+
+			if (hdr.type != RPCTypeResponse) {
+				logger_debug("unexpected message request.");
 				free(data);
 				return -1;
 			}
-		} else {
-			data = NULL;
-		}
-
-		if (hdr.type == RPCTypeResponse) {
 			msg->ret = data;
 			msg->ret_size = hdr.size;
 			break;
 		}
+		if (sess->alt && (pfds[1].revents & POLLIN)) {
+			if (rpc_recv(sess->alt, buf, sizeof(buf)) != 0) {
+				logger_debug("rpc_recv header failed.");
+				return -1;
+			}
 
-		req.method = hdr.method;
-		req.param = data;
-		req.param_size = hdr.size;
-		req.ret = NULL;
-		req.ret_size = 0;
+			rpcmsghdr_decode(&hdr, buf, sizeof(buf));
 
-		sess->dispatch(sess, &req, sess->ctxt);
+			if (hdr.size) {
+				data = malloc(hdr.size);
+				if (data == NULL)
+					return -1;
+				if (rpc_recv(sess->alt, data, hdr.size) != 0) {
+					logger_debug("rpc_recv failed.");
+					free(data);
+					return -1;
+				}
+			} else {
+				data = NULL;
+			}
 
-		free(data);
+			req.method = hdr.method;
+			req.param = data;
+			req.param_size = hdr.size;
+			req.ret = NULL;
+			req.ret_size = 0;
+
+			if (sess->alt->dispatch)
+				sess->alt->dispatch(sess->alt, &req,
+						sess->alt->ctxt);
+
+			free(data);
+		}
 	}
 
 	return 0;
@@ -224,7 +279,8 @@ rpc_handle(RPCSess *sess)
 	req.ret = NULL;
 	req.ret_size = 0;
 
-	sess->dispatch(sess, &req, sess->ctxt);
+	if (sess->dispatch)
+		sess->dispatch(sess, &req, sess->ctxt);
 
 	free(data);
 

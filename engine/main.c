@@ -415,8 +415,6 @@ NPP_SetWindow_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 			logger_debug("  ws_info: %p", window->ws_info);
 		} else {
 			VisualID visualid;
-			GdkScreen *gdk_screen;
-			GdkDisplay *gdk_display;
 			GdkVisual *gdk_visual;
 			Display *display;
 			Visual *visual;
@@ -432,11 +430,7 @@ NPP_SetWindow_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 			if (display == NULL) {
 				ws_info_data.display = NULL;
 			} else {
-				gdk_screen = gdk_screen_get_default();
-				gdk_display = gdk_screen_get_display(gdk_screen);
-				ws_info_data.display = gdk_x11_display_get_xdisplay(
-						gdk_display);
-
+				ws_info_data.display = b->display;
 				logger_debug("    => display: %p", ws_info_data.display);
 			}
 
@@ -445,16 +439,13 @@ NPP_SetWindow_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 			buf_uint64_decode(&r, &visualid);
 			logger_debug("      visualid: %lu", visualid);
 			if (visual == NULL) {
-				ws_info_data.visual = NULL;
+				gdk_visual = gdk_visual_get_system();
 			} else {
-				if (visualid == 0) {
-					gdk_visual = gdk_visual_get_system();
-				} else {
-					gdk_visual = gdk_x11_screen_lookup_visual(
-							gdk_screen, visualid);
-				}
-				ws_info_data.visual = gdk_x11_visual_get_xvisual(gdk_visual);
+				gdk_visual = gdk_x11_screen_lookup_visual(
+						gdk_screen_get_default(),
+					       	visualid);
 			}
+			ws_info_data.visual = gdk_x11_visual_get_xvisual(gdk_visual);
 			logger_debug("    visual: %p", ws_info_data.visual);
 
 			buf_uint64_decode(&r, &ws_info_data.colormap);
@@ -524,6 +515,7 @@ NPP_GetValue_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 	NPPVariable variable;
 	NPError error;
 	NPObject *npobj;
+	uint32_t x32;
 
 	logger_debug("start");
 
@@ -551,6 +543,15 @@ NPP_GetValue_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 		if (error == NPERR_NO_ERROR) {
 			logger_debug("npobj: %p", npobj);
 			buf_uint64_encode(&w, (uintptr_t)npobj);
+		}
+		break;
+	case NPPVpluginWantsAllNetworkStreams:
+		error = p->funcs.getvalue(npp, variable, &x32);
+		logger_debug("error: %s(%d)", np_errorstr(error), error);
+		buf_uint16_encode(&w, error);
+		if (error == NPERR_NO_ERROR) {
+			logger_debug("value: %"PRIu32, x32);
+			buf_uint32_encode(&w, x32);
 		}
 		break;
 	default:
@@ -858,6 +859,217 @@ NPP_Write_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
 	logger_debug("end");
 }
 
+static void
+NPP_HandleEvent_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	BufWriter w;
+	uintptr_t ident;
+	NPP npp;
+	XEvent event;
+	int16_t ret;
+	uint64_t x64;
+	uint32_t x32;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	memset(&event, 0, sizeof(event));
+
+	buf_uint32_decode(&r, &event.type);
+	logger_debug("type: %d", event.type);
+
+	buf_uint64_decode(&r, &x64);
+	event.xany.serial = x64;
+	logger_debug("serial: %lu", event.xany.serial);
+
+	buf_uint32_decode(&r, &x32);
+	event.xany.send_event = x32;
+	logger_debug("send_event: %d", event.xany.send_event);
+
+	event.xany.display = b->display;
+	logger_debug("display: %p", event.xany.display);
+
+	buf_uint64_decode(&r, &x64);
+	event.xany.window = x64;
+	logger_debug("window: %lu", event.xany.window);
+
+	switch (event.type) {
+	case GraphicsExpose:
+		logger_debug("expose");
+		buf_uint32_decode(&r, &event.xgraphicsexpose.x);
+		logger_debug("x: %d", event.xgraphicsexpose.x);
+		buf_uint32_decode(&r, &event.xgraphicsexpose.y);
+		logger_debug("y: %d", event.xgraphicsexpose.y);
+		buf_uint32_decode(&r, &event.xgraphicsexpose.width);
+		logger_debug("width: %d", event.xgraphicsexpose.width);
+		buf_uint32_decode(&r, &event.xgraphicsexpose.height);
+		logger_debug("height: %d", event.xgraphicsexpose.height);
+		buf_uint32_decode(&r, &event.xgraphicsexpose.count);
+		logger_debug("count: %d", event.xgraphicsexpose.count);
+		buf_uint32_decode(&r, &event.xgraphicsexpose.major_code);
+		logger_debug("major_code: %d", event.xgraphicsexpose.major_code);
+		buf_uint32_decode(&r, &event.xgraphicsexpose.minor_code);
+		logger_debug("minor_code: %d", event.xgraphicsexpose.minor_code);
+		break;
+	case FocusIn:
+	case FocusOut:
+		logger_debug("focus");
+		buf_uint32_decode(&r, &event.xfocus.mode);
+		logger_debug("mode: %u", event.xfocus.mode);
+		buf_uint32_decode(&r, &event.xfocus.detail);
+		logger_debug("detail: %u", event.xfocus.detail);
+		break;
+	case EnterNotify:
+	case LeaveNotify:
+		buf_uint64_decode(&r, &x64);
+		event.xcrossing.root = x64;
+		buf_uint64_decode(&r, &x64);
+		event.xcrossing.subwindow = x64;
+		buf_uint64_decode(&r, &x64);
+		event.xcrossing.time = x64;
+		buf_uint32_decode(&r, &event.xcrossing.x);
+		buf_uint32_decode(&r, &event.xcrossing.y);
+		buf_uint32_decode(&r, &event.xcrossing.x_root);
+		buf_uint32_decode(&r, &event.xcrossing.y_root);
+		buf_uint32_decode(&r, &event.xcrossing.mode);
+		buf_uint32_decode(&r, &event.xcrossing.detail);
+		buf_uint32_decode(&r, &x32);
+		event.xcrossing.same_screen = x32;
+		buf_uint32_decode(&r, &event.xcrossing.focus);
+		buf_uint32_decode(&r, &event.xcrossing.state);
+		break;
+	case MotionNotify:
+		buf_uint64_decode(&r, &x64);
+		event.xmotion.root = x64;
+		buf_uint64_decode(&r, &x64);
+		event.xmotion.subwindow = x64;
+		buf_uint64_decode(&r, &x64);
+		event.xmotion.time = x64;
+		buf_uint32_decode(&r, &event.xmotion.x);
+		buf_uint32_decode(&r, &event.xmotion.y);
+		buf_uint32_decode(&r, &event.xmotion.x_root);
+		buf_uint32_decode(&r, &event.xmotion.y_root);
+		buf_uint32_decode(&r, &event.xmotion.state);
+		buf_uint8_decode(&r, &event.xmotion.is_hint);
+		buf_uint32_decode(&r, &x32);
+		event.xmotion.same_screen = x32;
+		break;
+	case ButtonPress:
+	case ButtonRelease:
+		buf_uint64_decode(&r, &x64);
+		event.xbutton.root = x64;
+		buf_uint64_decode(&r, &x64);
+		event.xbutton.subwindow = x64;
+		buf_uint64_decode(&r, &x64);
+		event.xbutton.time = x64;
+		buf_uint32_decode(&r, &event.xbutton.x);
+		buf_uint32_decode(&r, &event.xbutton.y);
+		buf_uint32_decode(&r, &event.xbutton.x_root);
+		buf_uint32_decode(&r, &event.xbutton.y_root);
+		buf_uint32_decode(&r, &event.xbutton.state);
+		buf_uint32_decode(&r, &event.xbutton.button);
+		buf_uint32_decode(&r, &x32);
+		event.xbutton.same_screen = x32;
+		break;
+	case KeyPress:
+	case KeyRelease:
+		buf_uint64_decode(&r, &x64);
+		event.xkey.root = x64;
+		buf_uint64_decode(&r, &x64);
+		event.xkey.subwindow = x64;
+		buf_uint64_decode(&r, &x64);
+		event.xkey.time = x64;
+		buf_uint32_decode(&r, &event.xkey.x);
+		buf_uint32_decode(&r, &event.xkey.y);
+		buf_uint32_decode(&r, &event.xkey.x_root);
+		buf_uint32_decode(&r, &event.xkey.y_root);
+		buf_uint32_decode(&r, &event.xkey.state);
+		buf_uint32_decode(&r, &event.xkey.keycode);
+		buf_uint32_decode(&r, &x32);
+		event.xkey.same_screen = x32;
+		break;
+	default:
+		logger_debug("unknown");
+		break;
+	}
+
+	ret = p->funcs.event(npp, &event);
+
+	if (event.type == GraphicsExpose) {
+		gdk_flush();
+	}
+
+	logger_debug("ret: %"PRId16, ret);
+
+	buf_writer_open(&w, 0);
+	buf_uint16_encode(&w, ret);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPP_URLNotify_handle(Plugin *p, Browser *b, RPCSess *sess, RPCMsg *msg)
+{
+	BufReader r;
+	uintptr_t ident;
+	NPP npp;
+	uint32_t len;
+	const char *url;
+	NPReason reason;
+	void *notifyData;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, &ident);
+	logger_debug("npp_ident: %p", ident);
+	npp = npp_find(ident);
+	if (npp == NULL) {
+		logger_debug("npp_find failed.");
+		return;
+	}
+	logger_debug("npp: %p", npp);
+
+	buf_uint32_decode(&r, &len);
+	if (len) {
+		url = buf_bytes_decode(&r, len);
+	} else {
+		url = NULL;
+	}
+	logger_debug("url: '%s'", url);
+
+	buf_uint16_decode(&r, &reason);
+	logger_debug("reason: %u", reason);
+
+	buf_uint64_decode(&r, (uint64_t *)&notifyData);
+	logger_debug("notifyData: %p", notifyData);
+
+	p->funcs.urlnotify(npp, url, reason, notifyData);
+
+	rpc_return(sess, msg);
+
+	logger_debug("end");
+}
+
 
 static void
 np_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
@@ -906,6 +1118,12 @@ np_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
 	case RPC_NPP_Write:
 		NPP_Write_handle(p, b, sess, msg);
 		break;
+	case RPC_NPP_HandleEvent:
+		NPP_HandleEvent_handle(p, b, sess, msg);
+		break;
+	case RPC_NPP_URLNotify:
+		NPP_URLNotify_handle(p, b, sess, msg);
+		break;
 	default:
 		break;
 	}
@@ -925,8 +1143,6 @@ io_handler(GIOChannel *source, GIOCondition condition, gpointer data)
 		return false;
 	}
 
-	g_io_add_watch(source, G_IO_IN | G_IO_HUP, io_handler, data);
-
 	logger_debug("end");
 
 	return true;
@@ -941,18 +1157,23 @@ main(int argc, char **argv)
 	Plugin p;
 	Browser b;
 	RPCSess sess;
+	RPCSess rsess;
 	GIOChannel *channel;
 	int opt;
 	int fd;
+	int rfd;
 
 	path = "/usr/local/lib/browser_plugins/linux-flashplayer/libflashplayer.so";
 	fd = 0;
 	logger_fp = stdout;
 
-	while ((opt = getopt(argc, argv, "p:s:v")) != -1) {
+	while ((opt = getopt(argc, argv, "p:r:s:v")) != -1) {
 		switch (opt) {
 		case 'p':
 			path = optarg;
+			break;
+		case 'r':
+			rfd = strtol(optarg, NULL, 0);
 			break;
 		case 's':
 			fd = strtol(optarg, NULL, 0);
@@ -983,8 +1204,9 @@ main(int argc, char **argv)
 	np.pdata = &p;
 
 	rpcsess_init(&sess, fd, np_dispatch, &np);
+	rpcsess_init(&rsess, rfd, NULL, NULL);
 
-	if (browser_init(&b, &sess) != 0) {
+	if (browser_init(&b, &rsess) != 0) {
 		plugin_close(&p);
 		return 1;
 	}

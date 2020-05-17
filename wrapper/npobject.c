@@ -165,16 +165,20 @@ npobject_create(uintptr_t ident)
 {
 	Entry *e;
 
+	logger_debug("start(%p)", ident);
+
 	e = malloc(sizeof(*e));
 	if (e == NULL)
 		return NULL;
 
 	e->obj._class = &obj_class;
-	e->obj.referenceCount = 1;
+	e->obj.referenceCount = 2;
 	e->ident = ident;
 	e->next = head;
 	e->prev = NULL;
 	head = e;
+
+	logger_debug("end(%p)", &e->obj);
 
 	return &e->obj;
 }
@@ -184,6 +188,8 @@ npboject_destroy(NPObject *obj)
 {
 	Entry *e = (Entry *)obj;
 
+	logger_debug("start(%p)", e);
+
 	if (e->prev)
 		e->prev->next = e->next;
 	else
@@ -192,6 +198,8 @@ npboject_destroy(NPObject *obj)
 		e->next->prev = e->prev;
 
 	free(e);
+
+	logger_debug("end");
 }
 
 NPObject *
@@ -199,10 +207,13 @@ npobject_find(uintptr_t ident)
 {
 	Entry *e;
 
+	logger_debug("start(%p)", ident);
+
 	for (e = head; e != NULL; e = e->next)
 		if (e->ident == ident)
 			return &e->obj;
 
+	logger_debug("end(%p)", NULL);
 	return NULL;
 }
 
@@ -210,6 +221,10 @@ uintptr_t
 npobject_ident(NPObject *obj)
 {
 	Entry *e = (Entry *)obj;
+
+	logger_debug("start(%p)", e);
+
+	logger_debug("end(%p)", e->ident);
 
 	return e->ident;
 }

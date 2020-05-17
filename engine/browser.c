@@ -5,7 +5,11 @@
 #include <errno.h>
 #include <time.h>
 
+#include <pthread.h>
+
 #include <gtk/gtk.h>
+#include <gdk/gdk.h>
+#include <gdk/gdkx.h>
 
 #include "npapi.h"
 #include "npfunctions.h"
@@ -19,6 +23,7 @@
 
 
 static Browser *g_browser = NULL;
+static pthread_mutex_t invoke_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 static NPError
@@ -95,7 +100,9 @@ b_uagent(NPP npp)
 	msg.param = w.data;
 	msg.param_size = w.len;
 
+	pthread_mutex_lock(&invoke_mutex);
 	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
 
 	buf_writer_close(&w);
 
@@ -157,8 +164,59 @@ static NPError
 b_geturlnotify(NPP npp, const char *relativeURL, const char *target,
 		void *notifyData)
 {
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_GetURLNotify,
+	};
+	BufWriter w;
+	BufReader r;
+	NPError error;
+	uint32_t len;
+
 	logger_debug("start");
-	return NPERR_NO_ERROR;
+
+	logger_debug("npp: %p", npp);
+	logger_debug("relativeURL: %s", relativeURL);
+	logger_debug("target: %s", target);
+	logger_debug("notifyData: %p", notifyData);
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+	if (relativeURL) {
+		len = strlen(relativeURL) + 1;
+		buf_uint32_encode(&w, len);
+		buf_bytes_encode(&w, relativeURL, len);
+	} else {
+		buf_uint32_encode(&w, 0);
+	}
+	if (target) {
+		len = strlen(target) + 1;
+		buf_uint32_encode(&w, len);
+		buf_bytes_encode(&w, target, len);
+	} else {
+		buf_uint32_encode(&w, 0);
+	}
+	buf_uint64_encode(&w, (uintptr_t)notifyData);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	pthread_mutex_lock(&invoke_mutex);
+	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint16_decode(&r, &error);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	free(msg.ret);
+
+	logger_debug("end");
+
+	return error;
 }
 
 static NPError
@@ -193,7 +251,9 @@ b_getvalue(NPP npp, NPNVariable variable, void *result)
 	msg.param = w.data;
 	msg.param_size = w.len;
 
+	pthread_mutex_lock(&invoke_mutex);
 	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
 
 	buf_writer_close(&w);
 
@@ -210,7 +270,31 @@ b_getvalue(NPP npp, NPNVariable variable, void *result)
 	switch (variable) {
 	case NPNVxDisplay:
 	case NPNVxtAppContext:
+		break;
 	case NPNVnetscapeWindow:
+		{
+		Window xid;
+		GdkScreen *gdk_screen;
+		GdkDisplay *gdk_display;
+		GdkWindow *gdk_window;
+		Window window;
+	
+		buf_uint64_decode(&r, &xid);
+		logger_debug("xid: %p", xid);
+
+		gdk_screen = gdk_screen_get_default();
+		logger_debug("gdk_screen: %p", gdk_screen);
+		gdk_display = gdk_screen_get_display(gdk_screen);
+		logger_debug("gdk_display: %p", gdk_display);
+		gdk_window = gdk_x11_window_foreign_new_for_display(
+				gdk_display, xid);
+		logger_debug("gdk_window: %p", gdk_window);
+		window = GDK_WINDOW_XID(gdk_window);
+		logger_debug("window: %lu", window);
+		*((Window *)result) = window;
+		logger_debug("result: %p", *(Window *)result);
+		}
+		break;
 	case NPNVjavascriptEnabledBool:
 	case NPNVasdEnabledBool:
 	case NPNVisOfflineBool:
@@ -310,12 +394,16 @@ b_setvalue(NPP npp, NPPVariable variable, void *result)
 	msg.param = w.data;
 	msg.param_size = w.len;
 
+	pthread_mutex_lock(&invoke_mutex);
 	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
 
 	buf_writer_close(&w);
 
 	buf_reader_init(&r, msg.ret, msg.ret_size);
 	buf_uint16_decode(&r, &error);
+
+	free(msg.ret);
 
 	logger_debug("end(%s(%d))", np_errorstr(error), error);
 
@@ -325,7 +413,38 @@ b_setvalue(NPP npp, NPPVariable variable, void *result)
 static void
 b_invalidaterect(NPP npp, NPRect *invalidRect)
 {
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_InvalidateRect,
+	};
+	BufWriter w;
+
 	logger_debug("start");
+	logger_debug("npp: %p", npp);
+	logger_debug("invalidRect {");
+	logger_debug("  top: %"PRIu16, invalidRect->top);
+	logger_debug("  left: %"PRIu16, invalidRect->left);
+	logger_debug("  bottom: %"PRIu16, invalidRect->bottom);
+	logger_debug("  right: %"PRIu16, invalidRect->right);
+	logger_debug("}");
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+	buf_uint16_encode(&w, invalidRect->top);
+	buf_uint16_encode(&w, invalidRect->left);
+	buf_uint16_encode(&w, invalidRect->bottom);
+	buf_uint16_encode(&w, invalidRect->right);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	pthread_mutex_lock(&invoke_mutex);
+	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
 }
 
 static void
@@ -364,7 +483,9 @@ b_getstringidentifier(const NPUTF8 *name)
 	msg.param = w.data;
 	msg.param_size = w.len;
 
+	pthread_mutex_lock(&invoke_mutex);
 	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
 
 	buf_writer_close(&w);
 
@@ -475,7 +596,9 @@ b_releaseobject(NPObject *npobj)
 		msg.param = w.data;
 		msg.param_size = w.len;
 
+		pthread_mutex_lock(&invoke_mutex);
 		rpc_invoke(b->sess, &msg);
+		pthread_mutex_unlock(&invoke_mutex);
 
 		buf_writer_close(&w);
 		return;
@@ -515,8 +638,84 @@ static bool
 b_evaluate(NPP npp, NPObject *npobj, NPString *script,
 		NPVariant *result)
 {
-	logger_debug("start(%p)", npobj);
-	return false;
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_Evaluate,
+	};
+	BufWriter w;
+	BufReader r;
+	bool ret;
+	NPString *npstr;
+	uint8_t u8;
+	uint32_t len;
+	const char *s;
+
+	logger_debug("start");
+	logger_debug("npp: %p", npp);
+	logger_debug("npobj: %p", npobj);
+	logger_debug("script: '%s'", script->UTF8Characters);
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+	buf_uint64_encode(&w, (uintptr_t)npobj);
+	buf_uint32_encode(&w, script->UTF8Length + 1);
+	buf_bytes_encode(&w, script->UTF8Characters, script->UTF8Length + 1);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	pthread_mutex_lock(&invoke_mutex);
+	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint8_decode(&r, &u8);
+	ret = u8;
+	logger_debug("ret: %u", ret);
+
+	buf_uint32_decode(&r, &result->type);
+	logger_debug("result type: %u", result->type);
+	switch (result->type) {
+	case NPVariantType_Void:
+		logger_debug("void");
+		break;
+	case NPVariantType_Null:
+		logger_debug("null");
+		break;
+	case NPVariantType_Bool:
+		buf_uint8_decode(&r, &u8);
+		result->value.boolValue = u8;
+		logger_debug("bool: %u", result->value.boolValue);
+		break;
+	case NPVariantType_Int32:
+		buf_uint32_decode(&r, &result->value.intValue);
+		logger_debug("int: %"PRId32, result->value.intValue);
+		break;
+	case NPVariantType_Double:
+		buf_double_decode(&r, &result->value.doubleValue);
+		logger_debug("double: %f", result->value.doubleValue);
+		break;
+	case NPVariantType_String:
+		npstr = &result->value.stringValue;
+		buf_uint32_decode(&r, &len);
+		s = buf_bytes_decode(&r, len);
+		npstr->UTF8Length = len - 1;
+		npstr->UTF8Characters = strdup(s);
+		logger_debug("string: '%s'", npstr->UTF8Characters);
+		break;
+	case NPVariantType_Object:
+		buf_uint64_decode(&r, (uint64_t *)&result->value.objectValue);
+		logger_debug("object: %p", result->value.objectValue);
+		break;
+	}
+
+	free(msg.ret);
+
+	logger_debug("end");
+
+	return ret;
 }
 
 static bool
@@ -548,7 +747,9 @@ b_getproperty(NPP npp, NPObject *npobj, NPIdentifier property,
 	msg.param = w.data;
 	msg.param_size = w.len;
 
+	pthread_mutex_lock(&invoke_mutex);
 	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
 
 	buf_writer_close(&w);
 
@@ -660,13 +861,59 @@ b_setexception(NPObject *npobj, const NPUTF8 *message)
 static void
 b_pushpopupsenabledstate(NPP npp, NPBool enabled)
 {
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_PushPopupsEnabledState,
+	};
+	BufWriter w;
+
 	logger_debug("start");
+
+	logger_debug("npp: %p", npp);
+	logger_debug("enabled: %u", enabled);
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+	buf_uint8_encode(&w, enabled);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	pthread_mutex_lock(&invoke_mutex);
+	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
 }
 
 static void
 b_poppopupsenabledstate(NPP npp)
 {
+	Browser *b = g_browser;
+	RPCMsg msg = {
+		.method = RPC_NPN_PopPopupsEnabledState,
+	};
+	BufWriter w;
+
 	logger_debug("start");
+
+	logger_debug("npp: %p", npp);
+
+	buf_writer_open(&w, 0);
+	buf_uint64_encode(&w, npp_ident(npp));
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	pthread_mutex_lock(&invoke_mutex);
+	rpc_invoke(b->sess, &msg);
+	pthread_mutex_unlock(&invoke_mutex);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
 }
 
 static bool
@@ -780,14 +1027,14 @@ b_setcurrentasyncsurface(NPP instance, NPAsyncSurface *surface,
 	logger_debug("start");
 }
 
-#if 0
+#if 1
 #include <X11/Intrinsic.h>
 #endif
 
 int
 browser_init(Browser *b, RPCSess *sess)
 {
-#if 0
+#if 1
 	int argc = 1;
 	char *argv[] = {
 		"np_engine",
@@ -810,6 +1057,12 @@ browser_init(Browser *b, RPCSess *sess)
 	gtk_widget_set_size_request(b->window, 760, 680);
 	//gtk_widget_show(b->window);
 #endif
+#if 0
+	b->screen = gdk_screen_get_default();
+	logger_debug("gdk_screen: %p", b->screen);
+	b->display = gdk_screen_get_display(b->screen);
+	logger_debug("gdk_display: %p", b->display);
+#endif
 	g_browser = b;
 	logger_debug("browser: %p", b);
 
@@ -822,9 +1075,9 @@ browser_init(Browser *b, RPCSess *sess)
 	b->funcs.geturl = b_geturl;
 	b->funcs.posturl = b_posturl;
 	b->funcs.requestread = b_requestread;
-	//b->funcs.newstream = b_newstream;
-	//b->funcs.write = b_write;
-	//b->funcs.destroystream = b_destroystream;
+	b->funcs.newstream = b_newstream;
+	b->funcs.write = b_write;
+	b->funcs.destroystream = b_destroystream;
 	b->funcs.status = b_status;
 	b->funcs.uagent = b_uagent;
 	b->funcs.memalloc = b_memalloc;
@@ -866,17 +1119,17 @@ browser_init(Browser *b, RPCSess *sess)
 	b->funcs.construct = b_construct;
 	b->funcs.getvalueforurl = b_getvalueforurl;
 	b->funcs.setvalueforurl = b_setvalueforurl;
-	//b->funcs.getauthenticationinfo = b_getauthenticationinfo;
+	b->funcs.getauthenticationinfo = b_getauthenticationinfo;
 	b->funcs.scheduletimer = b_scheduletimer;
 	b->funcs.unscheduletimer = b_unscheduletimer;
-	//b->funcs.popupcontextmenu = b_popupcontextmenu;
-	//b->funcs.convertpoint = b_convertpoint;
-	//b->funcs.handleevent = NULL;
-	//b->funcs.unfocusinstance = NULL;
-	//b->funcs.urlredirectresponse = b_urlredirectresponse;
-	//b->funcs.initasyncsurface = b_initasyncsurface;
-	//b->funcs.finalizeasyncsurface = b_finalizeasyncsurface;
-	//b->funcs.setcurrentasyncsurface = b_setcurrentasyncsurface;
+	b->funcs.popupcontextmenu = b_popupcontextmenu;
+	b->funcs.convertpoint = b_convertpoint;
+	b->funcs.handleevent = NULL;
+	b->funcs.unfocusinstance = NULL;
+	b->funcs.urlredirectresponse = b_urlredirectresponse;
+	b->funcs.initasyncsurface = b_initasyncsurface;
+	b->funcs.finalizeasyncsurface = b_finalizeasyncsurface;
+	b->funcs.setcurrentasyncsurface = b_setcurrentasyncsurface;
 
 	return 0;
 }

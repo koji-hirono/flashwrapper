@@ -1,3 +1,6 @@
+#include <sys/types.h>
+#include <sys/resource.h>
+
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +21,15 @@
 int
 plugin_open(Plugin *p, const char *path)
 {
+	struct rlimit rlim;
+
+	rlim.rlim_cur = 0;
+	rlim.rlim_max = 0;
+	if (setrlimit(RLIMIT_CORE, &rlim) != 0) {
+		logger_debug("setrlimit %s", strerror(errno));
+		return -1;
+	}
+
 	p->h = dlopen(path, RTLD_LAZY);
 	if (p->h == NULL) {
 		logger_debug("dlopen %s", dlerror());

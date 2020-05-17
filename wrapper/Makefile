@@ -18,6 +18,7 @@ CPPFLAGS+=-I../include
 CPPFLAGS+=-I../common
 CPPFLAGS+=-DXP_UNIX=1
 CPPFLAGS+=-DMOZ_X11=1
+CPPFLAGS+=$(shell pkg-config --cflags gtk+-2.0)
 CPPFLAGS+=-fPIC
 CPPFLAGS+=-pipe
 

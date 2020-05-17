@@ -17,12 +17,17 @@
 int
 engine_open(Engine *e, const char *path, const char *plugin)
 {
+	int len;
 	int fds[2];
+	int rfds[2];
 	char name[32];
-	char *argv[] = {
+	char rname[32];
+	char *const argv[] = {
 		path,
 		"-s",
 		name,
+		"-r",
+		rname,
 		"-p",
 		plugin,
 		"-v",
@@ -32,21 +37,40 @@ engine_open(Engine *e, const char *path, const char *plugin)
 	if (socketpair(PF_LOCAL, SOCK_STREAM, 0, fds) != 0)
 		return -1;
 
+	if (socketpair(PF_LOCAL, SOCK_STREAM, 0, rfds) != 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return -1;
+	}
+
 	snprintf(name, sizeof(name), "%d", fds[0]);
+	snprintf(rname, sizeof(rname), "%d", rfds[0]);
+
+	len = 65536 * 2;
+	if (setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &len, sizeof(len)) != 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return -1;
+	}
 
 	e->pid = fork();
 	if (e->pid < 0) {
 		close(fds[0]);
 		close(fds[1]);
+		close(rfds[0]);
+		close(rfds[1]);
 		return -1;
 	}
 	if (e->pid == 0) {
 		close(fds[1]);
+		close(rfds[1]);
 		execv(path, argv);
 		_exit(0);
 	}
 	close(fds[0]);
+	close(rfds[0]);
 	e->fd = fds[1];
+	e->rfd = rfds[1];
 
 	return 0;
 }
@@ -58,6 +82,7 @@ engine_close(Engine *e)
 	int ret;
 
 	close(e->fd);
+	close(e->rfd);
 
 	ret = waitpid(e->pid, &status, WNOHANG);
 	if (ret == 0) {
@@ -70,42 +95,4 @@ engine_close(Engine *e)
 			waitpid(e->pid, &status, WNOHANG);
 		}
 	}
-}
-
-int
-engine_send(Engine *e, const void *data, size_t size)
-{
-	const char *p = data;
-	size_t len = size;
-	int r;
-
-	do {
-		r = write(e->fd, p, len);
-		if (r == -1)
-			return -1;
-		len -= r;
-		p += r;
-	} while (len != 0);
-
-	return 0;
-}
-
-int
-engine_recv(Engine *e, void *data, size_t size)
-{
-	char *p = data;
-	size_t len = size;
-	int r;
-
-	do {
-		r = read(e->fd, p, len);
-		if (r == -1)
-			return -1;
-		if (r == 0)
-			return -1;
-		len -= r;
-		p += r;
-	} while (len != 0);
-
-	return 0;
 }

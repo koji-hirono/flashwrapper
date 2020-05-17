@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+#include <gtk/gtk.h>
+
 #include "npapi.h"
 #include "npfunctions.h"
 
@@ -24,6 +26,7 @@ typedef struct Plugin Plugin;
 struct Wrapper {
 	NPNetscapeFuncs *bfuncs;
 	RPCSess sess;
+	RPCSess rsess;
 	Engine engine;
 	int inited;
 };
@@ -35,11 +38,49 @@ struct Plugin {
 
 static Wrapper g_wrapper;
 
+static void
+wrapper_flush(NPP instance, Wrapper *wrapper)
+{
+	Display *display = NULL;
+	NPError error;
+
+	logger_debug("start");
+
+	error = wrapper->bfuncs->getvalue(instance, NPNVxDisplay,
+			(void *)&display);
+	if (error != NPERR_NO_ERROR)
+		return;
+	if (display == NULL)
+		return;
+	XSync(display, 0);
+
+	logger_debug("end");
+}
+
+static void
+wrapper_ungrab(NPP instance, Wrapper *wrapper, Time time)
+{
+	Display *display = NULL;
+	NPError error;
+
+	logger_debug("start");
+
+	error = wrapper->bfuncs->getvalue(instance, NPNVxDisplay,
+			(void *)&display);
+	if (error != NPERR_NO_ERROR)
+		return;
+	if (display == NULL)
+		return;
+	XUngrabPointer(display, time);
+
+	logger_debug("end");
+}
+
 
 static void
 NPN_UserAgent_handle(Wrapper *wrapper, RPCMsg *msg)
 {
-	RPCSess *sess = &wrapper->sess;
+	RPCSess *sess = &wrapper->rsess;
 	NPP instance;
 	BufReader r;
 	BufWriter w;
@@ -79,7 +120,7 @@ NPN_UserAgent_handle(Wrapper *wrapper, RPCMsg *msg)
 static void
 NPN_GetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 {
-	RPCSess *sess = &wrapper->sess;
+	RPCSess *sess = &wrapper->rsess;
 	NPP instance;
 	BufWriter w;
 	BufReader r;
@@ -87,6 +128,8 @@ NPN_GetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 	NPError error;
 	uint32_t len;
 	NPNToolkitType toolkit;
+	/* GdkNativeWindow  xid */
+	uintptr_t xid;
 	NPBool boolval;
 	NPObject *npobj;
 	char *s;
@@ -138,6 +181,13 @@ NPN_GetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 			buf_uint32_encode(&w, 0);
 		}
 		break;
+	case NPNVnetscapeWindow:
+		error = wrapper->bfuncs->getvalue(instance, variable,
+				(void *)&xid);
+		logger_debug("value: %p", xid);
+		buf_uint16_encode(&w, error);
+		buf_uint64_encode(&w, xid);
+		break;
 	case NPNVWindowNPObject:
 		error = wrapper->bfuncs->getvalue(instance, variable,
 				(void *)&npobj);
@@ -165,7 +215,7 @@ NPN_GetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 static void
 NPN_SetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 {
-	RPCSess *sess = &wrapper->sess;
+	RPCSess *sess = &wrapper->rsess;
 	NPP instance;
 	BufWriter w;
 	BufReader r;
@@ -222,7 +272,7 @@ NPN_SetValue_handle(Wrapper *wrapper, RPCMsg *msg)
 static void
 NPN_ReleaseObject_handle(Wrapper *wrapper, RPCMsg *msg)
 {
-	RPCSess *sess = &wrapper->sess;
+	RPCSess *sess = &wrapper->rsess;
 	BufReader r;
 	NPObject *npobj;
 
@@ -246,7 +296,7 @@ NPN_ReleaseObject_handle(Wrapper *wrapper, RPCMsg *msg)
 static void
 NPN_GetStringIdentifier_handle(Wrapper *wrapper, RPCMsg *msg)
 {
-	RPCSess *sess = &wrapper->sess;
+	RPCSess *sess = &wrapper->rsess;
 	BufReader r;
 	BufWriter w;
 	uint32_t len;
@@ -282,7 +332,7 @@ NPN_GetStringIdentifier_handle(Wrapper *wrapper, RPCMsg *msg)
 static void
 NPN_GetProperty_handle(Wrapper *wrapper, RPCMsg *msg)
 {
-	RPCSess *sess = &wrapper->sess;
+	RPCSess *sess = &wrapper->rsess;
 	BufReader r;
 	BufWriter w;
 	NPP instance;
@@ -360,6 +410,220 @@ NPN_GetProperty_handle(Wrapper *wrapper, RPCMsg *msg)
 }
 
 static void
+NPN_Evaluate_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->rsess;
+	BufReader r;
+	BufWriter w;
+	NPP instance;
+	NPObject *npobj;
+	NPString script;
+	NPVariant result;
+	NPString *stringValue;
+	uint32_t len;
+	bool ret;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+
+	buf_uint64_decode(&r, (uint64_t *)&instance);
+	logger_debug("instance: %p", instance);
+
+	buf_uint64_decode(&r, (uint64_t *)&npobj);
+	logger_debug("npobj: %p", npobj);
+
+	buf_uint32_decode(&r, &len);
+	script.UTF8Length = len - 1;
+	script.UTF8Characters = buf_bytes_decode(&r, len);
+	logger_debug("script: '%s'", script.UTF8Characters);
+
+	VOID_TO_NPVARIANT(result);
+
+	ret = wrapper->bfuncs->evaluate(instance, npobj, &script, &result);
+
+	logger_debug("ret: %u", ret);
+
+	buf_writer_open(&w, 0);
+	buf_uint8_encode(&w, ret);
+
+	buf_uint32_encode(&w, result.type);
+	switch (result.type) {
+	case NPVariantType_Void:
+		logger_debug("void");
+		break;
+	case NPVariantType_Null:
+		logger_debug("null");
+		break;
+	case NPVariantType_Bool:
+		logger_debug("bool: %u", result.value.boolValue);
+		buf_uint8_encode(&w, result.value.boolValue);
+		break;
+	case NPVariantType_Int32:
+		logger_debug("int: %"PRId32, result.value.intValue);
+		buf_uint32_encode(&w, result.value.intValue);
+		break;
+	case NPVariantType_Double:
+		logger_debug("double: %f", result.value.doubleValue);
+		buf_double_encode(&w, result.value.doubleValue);
+		break;
+	case NPVariantType_String:
+		stringValue = &result.value.stringValue;
+		logger_debug("string: %s", stringValue->UTF8Characters);
+		buf_uint32_encode(&w, stringValue->UTF8Length + 1);
+		buf_bytes_encode(&w, stringValue->UTF8Characters,
+				stringValue->UTF8Length + 1);
+		break;
+	case NPVariantType_Object:
+		logger_debug("object: %p", result.value.objectValue);
+		buf_uint64_encode(&w, (uintptr_t)result.value.objectValue);
+		break;
+	default:
+		break;
+	}
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPN_InvalidateRect_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->rsess;
+	NPP instance;
+	BufReader r;
+	NPRect invalidRect;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+	buf_uint64_decode(&r, (uint64_t *)&instance);
+	logger_debug("instance: %p");
+	buf_uint16_decode(&r, &invalidRect.top);
+	buf_uint16_decode(&r, &invalidRect.left);
+	buf_uint16_decode(&r, &invalidRect.bottom);
+	buf_uint16_decode(&r, &invalidRect.right);
+	logger_debug("invalidRect {");
+	logger_debug("  top: %"PRIu16, invalidRect.top);
+	logger_debug("  left: %"PRIu16, invalidRect.left);
+	logger_debug("  bottom: %"PRIu16, invalidRect.bottom);
+	logger_debug("  right: %"PRIu16, invalidRect.right);
+	logger_debug("}");
+
+	wrapper->bfuncs->invalidaterect(instance, &invalidRect);
+
+	rpc_return(sess, msg);
+
+	logger_debug("end");
+}
+
+static void
+NPN_GetURLNotify_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->rsess;
+	NPP instance;
+	BufReader r;
+	BufWriter w;
+	NPError error;
+	uint32_t len;
+	const char *relativeURL;
+	const char *target;
+	void *notifyData;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+	buf_uint64_decode(&r, (uint64_t *)&instance);
+	logger_debug("instance: %p");
+	buf_uint32_decode(&r, &len);
+	if (len) {
+		relativeURL = buf_bytes_decode(&r, len);
+	} else {
+		relativeURL = NULL;
+	}
+	logger_debug("relativeURL: %s", relativeURL);
+
+	buf_uint32_decode(&r, &len);
+	if (len) {
+		target = buf_bytes_decode(&r, len);
+	} else {
+		target = NULL;
+	}
+	logger_debug("target: %s", target);
+
+	buf_uint64_decode(&r, (uint64_t *)&notifyData);
+	logger_debug("notifyData: %p", notifyData);
+
+	error = wrapper->bfuncs->geturlnotify(instance, relativeURL, target,
+			notifyData);
+
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
+	buf_writer_open(&w, 0);
+	buf_uint16_encode(&w, error);
+
+	msg->ret = w.data;
+	msg->ret_size = w.len;
+
+	rpc_return(sess, msg);
+
+	buf_writer_close(&w);
+
+	logger_debug("end");
+}
+
+static void
+NPN_PushPopupsEnabledState_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->rsess;
+	NPP instance;
+	BufReader r;
+	NPBool enabled;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+	buf_uint64_decode(&r, (uint64_t *)&instance);
+	logger_debug("instance: %p", instance);
+
+	buf_uint8_decode(&r, &enabled);
+	logger_debug("enabled: %u", enabled);
+
+	wrapper->bfuncs->pushpopupsenabledstate(instance, enabled);
+
+	rpc_return(sess, msg);
+
+	logger_debug("end");
+}
+
+static void
+NPN_PopPopupsEnabledState_handle(Wrapper *wrapper, RPCMsg *msg)
+{
+	RPCSess *sess = &wrapper->rsess;
+	NPP instance;
+	BufReader r;
+
+	logger_debug("start");
+
+	buf_reader_init(&r, msg->param, msg->param_size);
+	buf_uint64_decode(&r, (uint64_t *)&instance);
+	logger_debug("instance: %p", instance);
+
+	wrapper->bfuncs->poppopupsenabledstate(instance);
+
+	rpc_return(sess, msg);
+
+	logger_debug("end");
+}
+
+
+static void
 npn_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
 {
 	Wrapper *wrapper = ctxt;
@@ -383,11 +647,41 @@ npn_dispatch(RPCSess *sess, RPCMsg *msg, void *ctxt)
 	case RPC_NPN_GetProperty:
 		NPN_GetProperty_handle(wrapper, msg);
 		break;
+	case RPC_NPN_Evaluate:
+		NPN_Evaluate_handle(wrapper, msg);
+		break;
+	case RPC_NPN_InvalidateRect:
+		NPN_InvalidateRect_handle(wrapper, msg);
+		break;
+	case RPC_NPN_GetURLNotify:
+		NPN_GetURLNotify_handle(wrapper, msg);
+		break;
+	case RPC_NPN_PushPopupsEnabledState:
+		NPN_PushPopupsEnabledState_handle(wrapper, msg);
+		break;
+	case RPC_NPN_PopPopupsEnabledState:
+		NPN_PopPopupsEnabledState_handle(wrapper, msg);
+		break;
 	default:
 		break;
 	}
 }
 
+static gboolean
+io_handler(GIOChannel *source, GIOCondition condition, gpointer data)
+{
+	RPCSess *sess = data;
+
+	logger_debug("start");
+
+	if (rpc_handle(sess) != 0) {
+		logger_debug("rpc_handle failed.");
+                return false;
+        }
+
+        logger_debug("end");
+	return true;
+}
 
 static int
 wrapper_open(Wrapper *wrapper)
@@ -401,7 +695,21 @@ wrapper_open(Wrapper *wrapper)
 		return -1;
 	}
 
-	rpcsess_init(&wrapper->sess, wrapper->engine.fd, npn_dispatch, wrapper);
+	rpcsess_init(&wrapper->rsess, wrapper->engine.rfd, NULL,
+			npn_dispatch, wrapper);
+	rpcsess_init(&wrapper->sess, wrapper->engine.fd, &wrapper->rsess,
+			NULL, NULL);
+	{
+		GIOChannel *channel;
+
+		channel = g_io_channel_unix_new(wrapper->engine.fd);
+		if (channel == NULL) {
+			return -1;
+		}
+		g_io_channel_set_encoding(channel, NULL, NULL);
+		g_io_add_watch(channel, G_IO_IN | G_IO_HUP, io_handler,
+				&wrapper->rsess);
+	}
 
 	wrapper->inited = 1;
 
@@ -696,6 +1004,8 @@ pNPP_Destroy(NPP instance, NPSavedData **save)
 		return NPERR_GENERIC_ERROR;
 	}
 
+	logger_debug("error: %s(%d)", np_errorstr(error), error);
+
 	if (error != NPERR_NO_ERROR)
 		return error;
 
@@ -706,15 +1016,17 @@ pNPP_Destroy(NPP instance, NPSavedData **save)
 
 	if (len) {
 		data = buf_bytes_decode(&r, len);
-		saved = malloc(sizeof(*saved));
-		if (saved != NULL) {
-			saved->len = len;
-			saved->buf = malloc(len);
-			if (saved->buf == NULL) {
-				free(saved);
-			} else {
-				memcpy(saved->buf, data, len);
-				*save = saved;
+		if (save) {
+			saved = malloc(sizeof(*saved));
+			if (saved != NULL) {
+				saved->len = len;
+				saved->buf = malloc(len);
+				if (saved->buf == NULL) {
+					free(saved);
+				} else {
+					memcpy(saved->buf, data, len);
+					*save = saved;
+				}
 			}
 		}
 	}
@@ -1140,40 +1452,243 @@ pNPP_Print(NPP instance, NPPrint *platformPrint)
 static int16_t
 pNPP_HandleEvent(NPP instance, void *event)
 {
+	Wrapper *wrapper;
+	RPCSess *sess;
+	RPCMsg msg = {
+		.method = RPC_NPP_HandleEvent,
+	};
+	BufReader r;
+	BufWriter w;
 	NPEvent *npevent = event;
+	int16_t ret;
 
 	logger_debug("start");
+
+	wrapper = wrapper_get();
+	if (wrapper == NULL)
+		return NPERR_GENERIC_ERROR;
+
+	sess = &wrapper->sess;
+
+	buf_writer_open(&w, 0);
 
 	if (instance)
 		logger_debug("instance: {%p, %p}",
 				instance->pdata, instance->ndata);
+	buf_uint64_encode(&w, (uintptr_t)instance);
 
 	logger_debug("event: %p", event);
 	logger_debug("  type: %d", npevent->type);
+	buf_uint32_encode(&w, npevent->type);
+
+	logger_debug("  serial: %d", npevent->xany.serial);
+	buf_uint64_encode(&w, npevent->xany.serial);
+	logger_debug("  send_event: %d", npevent->xany.send_event);
+	buf_uint32_encode(&w, npevent->xany.send_event);
+	logger_debug("  window: %lu", npevent->xany.window);
+	buf_uint64_encode(&w, npevent->xany.window);
+
 	switch (npevent->type) {
 	case GraphicsExpose:
+		wrapper_flush(instance, wrapper);
 		logger_debug("expose");
+		logger_debug("  x: %d", npevent->xgraphicsexpose.x);
+		buf_uint32_encode(&w, npevent->xgraphicsexpose.x);
+		logger_debug("  y: %d", npevent->xgraphicsexpose.y);
+		buf_uint32_encode(&w, npevent->xgraphicsexpose.y);
+		logger_debug("  width: %d", npevent->xgraphicsexpose.width);
+		buf_uint32_encode(&w, npevent->xgraphicsexpose.width);
+		logger_debug("  height: %d", npevent->xgraphicsexpose.height);
+		buf_uint32_encode(&w, npevent->xgraphicsexpose.height);
+		logger_debug("  count: %d", npevent->xgraphicsexpose.count);
+		buf_uint32_encode(&w, npevent->xgraphicsexpose.count);
+		logger_debug("  major_code: %d",
+				npevent->xgraphicsexpose.major_code);
+		buf_uint32_encode(&w, npevent->xgraphicsexpose.major_code);
+		logger_debug("  minor_code: %d",
+				npevent->xgraphicsexpose.minor_code);
+		buf_uint32_encode(&w, npevent->xgraphicsexpose.minor_code);
+		break;
+	case FocusIn:
+	case FocusOut:
+		logger_debug("focus");
+		logger_debug("  mode: %d", npevent->xfocus.mode);
+		buf_uint32_encode(&w, npevent->xfocus.mode);
+		logger_debug("  detail: %d", npevent->xfocus.detail);
+		buf_uint32_encode(&w, npevent->xfocus.detail);
+		break;
+	case EnterNotify:
+	case LeaveNotify:
+		logger_debug("crossing");
+		logger_debug("  root: %lu", npevent->xcrossing.root);
+		buf_uint64_encode(&w, npevent->xcrossing.root);
+		logger_debug("  subwindow: %lu", npevent->xcrossing.subwindow);
+		buf_uint64_encode(&w, npevent->xcrossing.subwindow);
+		logger_debug("  time: %lu", npevent->xcrossing.time);
+		buf_uint64_encode(&w, npevent->xcrossing.time);
+		logger_debug("  x: %d", npevent->xcrossing.x);
+		buf_uint32_encode(&w, npevent->xcrossing.x);
+		logger_debug("  y: %d", npevent->xcrossing.y);
+		buf_uint32_encode(&w, npevent->xcrossing.y);
+		logger_debug("  x_root: %d", npevent->xcrossing.x_root);
+		buf_uint32_encode(&w, npevent->xcrossing.x_root);
+		logger_debug("  y_root: %d", npevent->xcrossing.y_root);
+		buf_uint32_encode(&w, npevent->xcrossing.y_root);
+		logger_debug("  mode: %d", npevent->xcrossing.mode);
+		buf_uint32_encode(&w, npevent->xcrossing.mode);
+		logger_debug("  detail: %d", npevent->xcrossing.detail);
+		buf_uint32_encode(&w, npevent->xcrossing.detail);
+		logger_debug("  same_screen: %d", npevent->xcrossing.same_screen);
+		buf_uint32_encode(&w, npevent->xcrossing.same_screen);
+		logger_debug("  focus: %d", npevent->xcrossing.focus);
+		buf_uint32_encode(&w, npevent->xcrossing.focus);
+		logger_debug("  state: %u", npevent->xcrossing.state);
+		buf_uint32_encode(&w, npevent->xcrossing.state);
+		break;
+	case MotionNotify:
+		logger_debug("motion");
+		logger_debug("  root: %lu", npevent->xmotion.root);
+		buf_uint64_encode(&w, npevent->xmotion.root);
+		logger_debug("  subwindow: %lu", npevent->xmotion.subwindow);
+		buf_uint64_encode(&w, npevent->xmotion.subwindow);
+		logger_debug("  time: %lu", npevent->xmotion.time);
+		buf_uint64_encode(&w, npevent->xmotion.time);
+		logger_debug("  x: %d", npevent->xmotion.x);
+		buf_uint32_encode(&w, npevent->xmotion.x);
+		logger_debug("  y: %d", npevent->xmotion.y);
+		buf_uint32_encode(&w, npevent->xmotion.y);
+		logger_debug("  x_root: %d", npevent->xmotion.x_root);
+		buf_uint32_encode(&w, npevent->xmotion.x_root);
+		logger_debug("  y_root: %d", npevent->xmotion.y_root);
+		buf_uint32_encode(&w, npevent->xmotion.y_root);
+		logger_debug("  state: %u", npevent->xmotion.state);
+		buf_uint32_encode(&w, npevent->xmotion.state);
+		logger_debug("  is_hint: %u", npevent->xmotion.is_hint);
+		buf_uint8_encode(&w, npevent->xmotion.is_hint);
+		logger_debug("  same_screen: %d", npevent->xmotion.same_screen);
+		buf_uint32_encode(&w, npevent->xmotion.same_screen);
 		break;
 	case ButtonPress:
+		wrapper_flush(instance, wrapper);
+		wrapper_ungrab(instance, wrapper, npevent->xbutton.time);
+	case ButtonRelease:
 		logger_debug("button");
+		logger_debug("  root: %lu", npevent->xbutton.root);
+		buf_uint64_encode(&w, npevent->xbutton.root);
+		logger_debug("  subwindow: %lu", npevent->xbutton.subwindow);
+		buf_uint64_encode(&w, npevent->xbutton.subwindow);
+		logger_debug("  time: %lu", npevent->xbutton.time);
+		buf_uint64_encode(&w, npevent->xbutton.time);
+		logger_debug("  x: %d", npevent->xbutton.x);
+		buf_uint32_encode(&w, npevent->xbutton.x);
+		logger_debug("  y: %d", npevent->xbutton.y);
+		buf_uint32_encode(&w, npevent->xbutton.y);
+		logger_debug("  x_root: %d", npevent->xbutton.x_root);
+		buf_uint32_encode(&w, npevent->xbutton.x_root);
+		logger_debug("  y_root: %d", npevent->xbutton.y_root);
+		buf_uint32_encode(&w, npevent->xbutton.y_root);
+		logger_debug("  state: %u", npevent->xbutton.state);
+		buf_uint32_encode(&w, npevent->xbutton.state);
+		logger_debug("  button: %u", npevent->xbutton.button);
+		buf_uint32_encode(&w, npevent->xbutton.button);
+		logger_debug("  same_screen: %d", npevent->xbutton.same_screen);
+		buf_uint32_encode(&w, npevent->xbutton.same_screen);
+		break;
+	case KeyPress:
+	case KeyRelease:
+		logger_debug("key");
+		logger_debug("  root: %lu", npevent->xkey.root);
+		buf_uint64_encode(&w, npevent->xkey.root);
+		logger_debug("  subwindow: %lu", npevent->xkey.subwindow);
+		buf_uint64_encode(&w, npevent->xkey.subwindow);
+		logger_debug("  time: %lu", npevent->xkey.time);
+		buf_uint64_encode(&w, npevent->xkey.time);
+		logger_debug("  x: %d", npevent->xkey.x);
+		buf_uint32_encode(&w, npevent->xkey.x);
+		logger_debug("  y: %d", npevent->xkey.y);
+		buf_uint32_encode(&w, npevent->xkey.y);
+		logger_debug("  x_root: %d", npevent->xkey.x_root);
+		buf_uint32_encode(&w, npevent->xkey.x_root);
+		logger_debug("  y_root: %d", npevent->xkey.y_root);
+		buf_uint32_encode(&w, npevent->xkey.y_root);
+		logger_debug("  state: %u", npevent->xkey.state);
+		buf_uint32_encode(&w, npevent->xkey.state);
+		logger_debug("  keycode: %u", npevent->xkey.keycode);
+		buf_uint32_encode(&w, npevent->xkey.keycode);
+		logger_debug("  same_screen: %d", npevent->xkey.same_screen);
+		buf_uint32_encode(&w, npevent->xkey.same_screen);
 		break;
 	default:
+		logger_debug("unknown");
 		break;
 	}
 
-	logger_debug("end");
+	msg.param = w.data;
+	msg.param_size = w.len;
 
-	return 0;
+	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
+
+	buf_reader_init(&r, msg.ret, msg.ret_size);
+	buf_uint16_decode(&r, &ret);
+
+	logger_debug("ret: %"PRId16, ret);
+
+	free(msg.ret);
+
+	logger_debug("end");
+	return ret;
 }
 
 static void
 pNPP_URLNotify(NPP instance, const char *url, NPReason reason, void *notifyData)
 {
+	Wrapper *wrapper;
+	RPCSess *sess;
+	RPCMsg msg = {
+		.method = RPC_NPP_URLNotify,
+	};
+	BufWriter w;
+	uint32_t len;
+
 	logger_debug("start");
-	logger_debug("instance: {%p, %p}", instance->pdata, instance->ndata);
+
+	wrapper = wrapper_get();
+	if (wrapper == NULL)
+		return;
+
+	sess = &wrapper->sess;
+
+	buf_writer_open(&w, 0);
+
+	if (instance)
+		logger_debug("instance: {%p, %p}",
+				instance->pdata, instance->ndata);
+	buf_uint64_encode(&w, (uintptr_t)instance);
+
 	logger_debug("url: '%s'", url);
+	if (url) {
+		len = strlen(url) + 1;
+		buf_uint32_encode(&w, len);
+		buf_bytes_encode(&w, url, len);
+	} else {
+		buf_uint32_encode(&w, 0);
+	}
+
 	logger_debug("reason: %u", reason);
+	buf_uint16_encode(&w, reason);
+
 	logger_debug("notifyData: %p", notifyData);
+	buf_uint64_encode(&w, (uintptr_t)notifyData);
+
+	msg.param = w.data;
+	msg.param_size = w.len;
+
+	rpc_invoke(&wrapper->sess, &msg);
+
+	buf_writer_close(&w);
+
 	logger_debug("end");
 }
 
@@ -1189,6 +1704,7 @@ pNPP_GetValue(NPP instance, NPPVariable variable, void *ret_value)
 	BufWriter w;
 	NPError error;
 	uintptr_t ident;
+	uint32_t x32;
 	NPObject *npobj;
 
 	logger_debug("start");
@@ -1243,6 +1759,11 @@ pNPP_GetValue(NPP instance, NPPVariable variable, void *ret_value)
 		}
 		logger_debug("npobj: %p", npobj);
 		*(NPObject **)ret_value = npobj;
+		break;
+	case NPPVpluginWantsAllNetworkStreams:
+		buf_uint32_decode(&r, &x32);
+		logger_debug("value: %"PRIu32, x32);
+		*(uint32_t *)ret_value = x32;
 		break;
 	default:
 		free(msg.ret);

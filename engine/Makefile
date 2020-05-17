@@ -11,6 +11,7 @@ SRCS+=../common/logger.c
 OBJS:=$(SRCS:.c=.o)
 
 LDADD:=$(shell pkg-config --libs gtk+-2.0)
+LDADD+=$(shell pkg-config --libs gthread-2.0)
 LDADD+=-lXt
 LDADD+=-ldl
 
@@ -25,6 +26,7 @@ CPPFLAGS+=-I../common
 CPPFLAGS+=-DXP_UNIX=1
 CPPFLAGS+=-DMOZ_X11=1
 CPPFLAGS+=$(shell pkg-config --cflags gtk+-2.0)
+CPPFLAGS+=$(shell pkg-config --cflags gthread-2.0)
 
 all: $(PROG)
 

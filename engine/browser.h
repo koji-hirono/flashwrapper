@@ -12,7 +12,6 @@ struct Browser {
 	RPCSess *sess;
 	void *app_context;
 	void *display;
-	void *window;
 	NPNetscapeFuncs funcs;
 };
 
